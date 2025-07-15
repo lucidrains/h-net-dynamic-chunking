@@ -105,20 +105,20 @@ class DynamicChunkingDownsampler(Module):
 
         boundary_mask = probs > self.boundary_threshold # bool[b n]
 
-        boundary_mask[:, -1] = True # last token must always be a boundary?
+        boundary_mask[:, 0] = True # first token must always be boundary
 
         # compute some lengths, per chunk and number of chunks per batch
 
-        num_chunks = boundary_mask.long().sum(dim = -1).tolist()
+        num_chunks = boundary_mask.long().sum(dim = -1)
 
-        sel_indices = repeat(arange(boundary_mask.shape[-1], device = device), 'n -> b n', b = batch)[boundary_mask]
+        boundary_mask_with_end = pad(boundary_mask, (0, 1), value = True)
+        sel_indices = repeat(arange(boundary_mask_with_end.shape[-1], device = device), 'n -> b n', b = batch)[boundary_mask_with_end]
 
-        sel_indices = nested_tensor(sel_indices.split(num_chunks), layout = torch.jagged, device = device)
+        sel_indices = nested_tensor(sel_indices.split((num_chunks + 1).tolist()), layout = torch.jagged, device = device)
 
         sel_indices = sel_indices.to_padded_tensor(padding = -1)
-        mask = sel_indices != -1
 
-        sel_indices = pad(sel_indices, (1, 0), value = -1)
+        mask = (sel_indices != -1)[:, 1:]
 
         chunk_lens = sel_indices[:, 1:] - sel_indices[:, :-1]
         chunk_lens.masked_fill_(~mask, 0)
@@ -127,13 +127,13 @@ class DynamicChunkingDownsampler(Module):
 
         boundary_tokens = tokens[boundary_mask] # pick out boundary tokens
 
-        tokens_nt = nested_tensor(boundary_tokens.split(num_chunks), layout = torch.jagged, device = device, requires_grad = True)
+        tokens_nt = nested_tensor(boundary_tokens.split(num_chunks.tolist()), layout = torch.jagged, device = device, requires_grad = True)
 
         downsampled_tokens = tokens_nt.to_padded_tensor(padding = 0.)
 
         # smoothing module for improved gradients eq(5)
 
-        probs_nt = nested_tensor(probs[boundary_mask].split(num_chunks), layout = torch.jagged, device = device, requires_grad = True)
+        probs_nt = nested_tensor(probs[boundary_mask].split(num_chunks.tolist()), layout = torch.jagged, device = device, requires_grad = True)
 
         boundary_probs = probs_nt.to_padded_tensor(padding = 0.)
 
