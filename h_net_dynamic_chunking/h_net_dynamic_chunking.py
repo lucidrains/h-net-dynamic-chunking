@@ -92,4 +92,6 @@ class CosineSimRouting(Module):
 
             aux_ratio_loss = N / (N - 1) * ((N - 1) * F * G + (1. - F) * (1. - G))
 
-        return prob_boundary, boundaries, upsampler_output_scale, aux_ratio_loss
+            aux_loss = aux_ratio_loss.mean() * self.ratio_loss_weight
+
+        return prob_boundary, boundaries, upsampler_output_scale, aux_loss
