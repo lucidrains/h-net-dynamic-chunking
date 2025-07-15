@@ -24,6 +24,7 @@ Outputs = namedtuple('Outputs', [
 Intermediates = namedtuple('Intermediates', [
     'mask',
     'probs',
+    'chunk_lens',
     'boundary_mask',
     'upsampler_output_scale'
 ])
@@ -199,7 +200,7 @@ class DynamicChunkingDownsampler(Module):
 
         outputs = Outputs(smoothed_downsampled_tokens, upsample, aux_loss)
 
-        intermediates = Intermediates(mask, probs, boundary_mask, upsampler_output_scale)
+        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, upsampler_output_scale)
 
         if not return_intermediates:
             return outputs
