@@ -8,6 +8,8 @@ def test_chunker():
 
     tokens = torch.randn(3, 1024, 512).requires_grad_()
 
-    downsampled, upsample_fn, *_ = downsampler(tokens)
+    downsampled, upsample_fn, aux_loss = downsampler(tokens)
+
+    aux_loss.mean().backward()
 
     assert upsample_fn(downsampled).shape == tokens.shape

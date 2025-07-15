@@ -61,7 +61,8 @@ class DynamicChunkingDownsampler(Module):
 
     def forward(
         self,
-        tokens # float[b n d]
+        tokens, # float[b n d],
+        return_intermediates = False
     ):
         batch, length, device = *tokens.shape[:2], tokens.device
 
@@ -125,6 +126,7 @@ class DynamicChunkingDownsampler(Module):
 
         upsampler_output_scale = 1.
         aux_ratio_loss = self.zero
+        aux_loss = self.zero
 
         needs_grad = tokens.requires_grad
 
@@ -165,4 +167,13 @@ class DynamicChunkingDownsampler(Module):
 
             return upsampled
 
-        return smoothed_downsampled_tokens, upsample, probs, boundary_mask, upsampler_output_scale, aux_ratio_loss
+        # returning
+
+        outputs = (smoothed_downsampled_tokens, upsample, aux_loss)
+
+        intermediates = (probs, boundary_mask, upsampler_output_scale)
+
+        if not return_intermediates:
+            return outputs
+
+        return outputs, intermediates
