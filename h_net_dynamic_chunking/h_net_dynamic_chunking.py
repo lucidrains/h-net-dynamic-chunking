@@ -79,6 +79,8 @@ class CosineSimRouting(Module):
 
         boundary_mask = probs > self.boundary_threshold # bool[b n]
 
+        boundary_mask[:, -1] = True # last token must always be a boundary?
+
         # downsampling - they show in their experiments that picking out the boundary tokens works just fine
 
         lens = boundary_mask.long().sum(dim = -1).tolist()
