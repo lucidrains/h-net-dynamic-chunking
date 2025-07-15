@@ -1,3 +1,5 @@
+# following section 2.2 of the paper
+
 import torch
 from torch import cat
 from torch.nn import Module, Linear, Parameter
@@ -12,9 +14,6 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
-
-def l2norm(t):
-    return F.normalize(t, dim = -1)
 
 # classes
 
@@ -34,7 +33,7 @@ class CosineSimRouting(Module):
 
         # start key token, so first token can be segmented / chunked out
 
-        self.start_key_token = Parameter(torch.ones(dim_queries_keys) * 1e-2) # presumably, need a start key token for the first token, open an issue if i got it wrong
+        self.start_key_token = Parameter(torch.randn(dim_queries_keys) * 1e-2) # presumably, need a start key token for the first token, open an issue if i got it wrong
 
         # threshold to determine boundary
 
@@ -56,8 +55,16 @@ class CosineSimRouting(Module):
 
         cosine_sim  = F.cosine_similarity(queries, keys[:, :-1], dim = -1)
 
-        prob_boundary = (1. - cosine_sim) * 0.5
+        prob_boundary = (1. - cosine_sim) * 0.5 # cosine sim is -1. to 1., this transforms it to 0. to 1.
 
-        boundaries = prob_boundary > self.boundary_threshold
+        boundaries = prob_boundary > self.boundary_threshold # bool[b n]
 
-        return prob_boundary, boundaries
+        # for the upsampler
+
+        confidence = torch.where(boundaries, prob_boundary, 1. - prob_boundary)
+
+        # straight through for 1. multiplier on the expanded processed boundary tokens
+
+        upsampler_output_scale = confidence * (1. - confidence).detach()
+
+        return prob_boundary, boundaries, upsampler_output_scale
