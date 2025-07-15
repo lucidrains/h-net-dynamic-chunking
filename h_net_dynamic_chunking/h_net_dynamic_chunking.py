@@ -37,6 +37,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def straight_through(t, value):
+    return t + (value - t).detach()
+
 # classes
 
 class DynamicChunkingDownsampler(Module):
@@ -45,10 +48,11 @@ class DynamicChunkingDownsampler(Module):
         dim,
         dim_queries_keys = None,
         boundary_threshold = 0.5,
-        target_avg_token_length = 6.,   # N in eq(10)
+        target_avg_token_length = 6.,       # N in eq(10)
         ratio_loss_weight = 3e-2,
-        handle_residual_proj = False,   # turning this on will automatically handle a projection of the residual and its application in the inverse upsample function
+        handle_residual_proj = False,       # turning this on will automatically handle a projection of the residual and its application in the inverse upsample function
         assoc_scan_use_accelerated = False,
+        straight_through_frac_vecs = True,  # improvisation where F receives gradients through straight-through with sigmoid
     ):
         super().__init__()
         dim_queries_keys = default(dim_queries_keys, dim)
@@ -62,6 +66,8 @@ class DynamicChunkingDownsampler(Module):
         self.start_key_token = Parameter(torch.randn(dim_queries_keys) * 1e-2) # presumably, need a start key token for the first token, open an issue if i got it wrong
 
         # threshold to determine boundary
+
+        assert 0. < boundary_threshold < 1.
 
         self.boundary_threshold = boundary_threshold
 
@@ -79,6 +85,9 @@ class DynamicChunkingDownsampler(Module):
         # ratio aux loss related
 
         self.target_avg_token_length = target_avg_token_length
+
+        self.straight_through_frac_vecs = straight_through_frac_vecs
+
         self.ratio_loss_weight = ratio_loss_weight
 
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
@@ -159,15 +168,23 @@ class DynamicChunkingDownsampler(Module):
         if needs_grad:
             # straight through for 1. multiplier on the expanded processed boundary tokens
 
-            upsampler_output_scale = confidence * (1. - confidence).detach()
+            upsampler_output_scale = straight_through(confidence, 1.)
 
             # auxiliary ratio loss in section 2.3.2, eq (10)
             # lets follow their notation
 
             N = self.target_avg_token_length
 
-            F = boundary_mask.float().mean(dim = -1)
+            F = boundary_mask.float()
             G = probs.mean(dim = -1)
+
+            # allow for a soft F to straight through - https://arxiv.org/abs/2505.22074
+
+            if self.straight_through_frac_vecs:
+                F_soft = (probs - self.boundary_threshold).sigmoid()
+                F = straight_through(F_soft, F)
+
+            F = F.mean(dim = -1)
 
             aux_ratio_loss = N / (N - 1) * ((N - 1) * F * G + (1. - F) * (1. - G))
 
