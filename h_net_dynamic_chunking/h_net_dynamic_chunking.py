@@ -13,6 +13,21 @@ from einops import repeat, rearrange
 
 from assoc_scan import AssocScan
 
+# constants
+
+Outputs = namedtuple('Outputs', [
+    'downsampled',
+    'upsample_fn',
+    'aux_loss'
+])
+
+Intermediates = namedtuple('Intermediates', [
+    'mask',
+    'probs',
+    'boundary_mask',
+    'upsampler_output_scale'
+])
+
 # helper functions
 
 def exists(v):
@@ -182,9 +197,9 @@ class DynamicChunkingDownsampler(Module):
 
         # returning
 
-        outputs = (smoothed_downsampled_tokens, upsample, aux_loss)
+        outputs = Outputs(smoothed_downsampled_tokens, upsample, aux_loss)
 
-        intermediates = (probs, boundary_mask, upsampler_output_scale)
+        intermediates = Intermediates(mask, probs, boundary_mask, upsampler_output_scale)
 
         if not return_intermediates:
             return outputs
