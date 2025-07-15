@@ -25,6 +25,35 @@ downsampled, upsample_fn, *_ = downsampler(tokens)
 assert upsample_fn(downsampled).shape == tokens.shape
 ```
 
+3 layers hierarchy
+
+```python
+import torch
+from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicChunkingDownsampler
+
+downsampler1 = DynamicChunkingDownsampler(512)
+downsampler2 = DynamicChunkingDownsampler(512)
+downsampler3 = DynamicChunkingDownsampler(512)
+
+tokens = torch.randn(3, 1024, 512).requires_grad_()
+
+downsampled1, upsample_fn1, aux_loss1 = downsampler1(tokens)
+
+# hierarchical network 1 ...
+
+downsampled2, upsample_fn2, aux_loss2 = downsampler2(downsampled1)
+
+# hierarchical network 2 ...
+
+downsampled3, upsample_fn3, aux_loss3 = downsampler3(downsampled2)
+
+# inner most network
+
+# reconstituting
+
+assert upsample_fn1(upsample_fn2(upsample_fn3(downsampled3))).shape == tokens.shape
+```
+
 ## Citations
 
 ```bibtex
