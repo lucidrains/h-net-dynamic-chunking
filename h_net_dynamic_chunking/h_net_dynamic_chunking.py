@@ -3,12 +3,12 @@
 from collections import namedtuple
 
 import torch
-from torch import cat
+from torch import cat, arange
 from torch.nested import nested_tensor
 from torch.nn import Module, Linear, Parameter
-from torch.nn.functional import cosine_similarity
+from torch.nn.functional import cosine_similarity, pad
 
-import einx
+from einx import multiply
 from einops import repeat, rearrange
 
 from assoc_scan import AssocScan
@@ -23,7 +23,7 @@ def default(v, d):
 
 # classes
 
-class CosineSimRouting(Module):
+class DynamicChunkingDownsampler(Module):
     def __init__(
         self,
         dim,
@@ -81,25 +81,39 @@ class CosineSimRouting(Module):
 
         boundary_mask[:, -1] = True # last token must always be a boundary?
 
-        # downsampling - they show in their experiments that picking out the boundary tokens works just fine
+        # compute some lengths, per chunk and number of chunks per batch
 
-        lens = boundary_mask.long().sum(dim = -1).tolist()
+        num_chunks = boundary_mask.long().sum(dim = -1).tolist()
+
+        sel_indices = repeat(arange(boundary_mask.shape[-1], device = device), 'n -> b n', b = batch)[boundary_mask]
+
+        sel_indices = nested_tensor(sel_indices.split(num_chunks), layout = torch.jagged, device = device)
+
+        sel_indices = sel_indices.to_padded_tensor(padding = -1)
+        mask = sel_indices != -1
+
+        sel_indices = pad(sel_indices, (1, 0), value = -1)
+
+        chunk_lens = sel_indices[:, 1:] - sel_indices[:, :-1]
+        chunk_lens.masked_fill_(~mask, 0)
+
+        # downsampling - they show in their experiments that picking out the boundary tokens works just fine
 
         boundary_tokens = tokens[boundary_mask] # pick out boundary tokens
 
-        tokens_nt = nested_tensor(boundary_tokens.split(lens), layout = torch.jagged, device = device, requires_grad = True)
+        tokens_nt = nested_tensor(boundary_tokens.split(num_chunks), layout = torch.jagged, device = device, requires_grad = True)
 
         downsampled_tokens = tokens_nt.to_padded_tensor(padding = 0.)
 
         # smoothing module for improved gradients eq(5)
 
-        probs_nt = nested_tensor(probs[boundary_mask].split(lens), layout = torch.jagged, device = device, requires_grad = True)
+        probs_nt = nested_tensor(probs[boundary_mask].split(num_chunks), layout = torch.jagged, device = device, requires_grad = True)
 
         boundary_probs = probs_nt.to_padded_tensor(padding = 0.)
 
         gates = 1. - boundary_probs
 
-        downsampled_tokens = einx.multiply('b n d, b n', downsampled_tokens, boundary_probs)
+        downsampled_tokens = multiply('b n d, b n', downsampled_tokens, boundary_probs)
 
         smoothed_downsampled_tokens = self.smooth_assoc_scan(gates, downsampled_tokens)
 
@@ -112,7 +126,9 @@ class CosineSimRouting(Module):
         upsampler_output_scale = 1.
         aux_ratio_loss = self.zero
 
-        if self.training or tokens.requires_grad:
+        needs_grad = tokens.requires_grad
+
+        if needs_grad:
             # straight through for 1. multiplier on the expanded processed boundary tokens
 
             upsampler_output_scale = confidence * (1. - confidence).detach()
@@ -129,4 +145,24 @@ class CosineSimRouting(Module):
 
             aux_loss = aux_ratio_loss.mean() * self.ratio_loss_weight
 
-        return smoothed_downsampled_tokens, probs, boundary_mask, upsampler_output_scale, aux_loss
+        # return the upsample function
+
+        def upsample(downsampled, apply_scale = True):
+            device = downsampled.device
+
+            downsampled_without_padding = downsampled[mask]
+            chunk_lens_without_padding = chunk_lens[mask]
+
+            seq = arange(downsampled_without_padding.shape[0], device = device)
+
+            repeated_indices = torch.repeat_interleave(seq, chunk_lens_without_padding, dim = 0)
+            upsampled = downsampled_without_padding[repeated_indices]
+
+            upsampled = rearrange(upsampled, '(b n) d -> b n d', b = batch)
+
+            if needs_grad and apply_scale:
+                upsampled = multiply('b n d, b n', upsampled, upsampler_output_scale)
+
+            return upsampled
+
+        return smoothed_downsampled_tokens, upsample, probs, boundary_mask, upsampler_output_scale, aux_ratio_loss
