@@ -29,9 +29,10 @@ class DynamicChunkingDownsampler(Module):
         dim,
         dim_queries_keys = None,
         boundary_threshold = 0.5,
-        target_avg_token_length = 6., # N in eq(10)
+        target_avg_token_length = 6.,   # N in eq(10)
         ratio_loss_weight = 3e-2,
-        assoc_scan_use_accelerated = False
+        handle_residual_proj = False,   # turning this on will automatically handle a projection of the residual and its application in the inverse upsample function
+        assoc_scan_use_accelerated = False,
     ):
         super().__init__()
         dim_queries_keys = default(dim_queries_keys, dim)
@@ -52,6 +53,13 @@ class DynamicChunkingDownsampler(Module):
 
         self.smooth_assoc_scan = AssocScan(use_accelerated = assoc_scan_use_accelerated)
 
+        # maybe residual proj
+
+        self.handle_residual_proj = handle_residual_proj
+
+        if handle_residual_proj:
+            self.residual_proj = Linear(dim, dim)
+
         # ratio aux loss related
 
         self.target_avg_token_length = target_avg_token_length
@@ -65,6 +73,8 @@ class DynamicChunkingDownsampler(Module):
         return_intermediates = False
     ):
         batch, length, device = *tokens.shape[:2], tokens.device
+
+        residual = tokens
 
         queries, keys = self.to_queries_keys(tokens).chunk(2, dim = -1)
 
@@ -164,6 +174,9 @@ class DynamicChunkingDownsampler(Module):
 
             if needs_grad and apply_scale:
                 upsampled = multiply('b n d, b n', upsampled, upsampler_output_scale)
+
+            if self.handle_residual_proj:
+                upsampled = upsampled + self.residual_proj(residual)
 
             return upsampled
 
