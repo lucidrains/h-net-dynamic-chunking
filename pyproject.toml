@@ -24,8 +24,9 @@ classifiers=[
 ]
 
 dependencies = [
+    "assoc-scan>=0.0.2",
+    "einops>=0.8.0",
     "torch>=2.4",
-    "einops>=0.8.0"
 ]
 
 [project.urls]
