@@ -105,6 +105,37 @@ class DynamicChunkingDownsampler(Module):
 
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
+    def upsample(
+        self,
+        downsampled,
+        intermediates: Intermediates,
+        apply_scale = True
+    ):
+        batch, needs_grad = downsampled.shape[0], downsampled.requires_grad
+
+        device = downsampled.device
+        mask = intermediates.mask
+
+        downsampled_without_padding = downsampled[mask]
+        chunk_lens_without_padding = intermediates.chunk_lens[mask]
+
+        seq = arange(downsampled_without_padding.shape[0], device = device)
+
+        repeated_indices = torch.repeat_interleave(seq, chunk_lens_without_padding, dim = 0)
+        upsampled = downsampled_without_padding[repeated_indices]
+
+        upsampled = rearrange(upsampled, '(b n) d -> b n d', b = batch)
+
+        if needs_grad and apply_scale:
+            upsampled = multiply('b n d, b n', upsampled, intermediates.upsampler_output_scale)
+
+        if self.handle_residual_proj:
+            upsampled = upsampled + self.residual_proj(residual)
+
+        upsampled = frac_gradient(upsampled, 1. / self.learning_rate_difference)
+
+        return upsampled
+
     def forward(
         self,
         tokens, # float[b n d],
@@ -203,30 +234,15 @@ class DynamicChunkingDownsampler(Module):
 
             aux_loss = aux_ratio_loss.mean() * self.ratio_loss_weight
 
+        # intermediates
+
+        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, upsampler_output_scale)
+
         # return the upsample function
 
         def upsample(downsampled, apply_scale = True):
-            device = downsampled.device
 
-            downsampled_without_padding = downsampled[mask]
-            chunk_lens_without_padding = chunk_lens[mask]
-
-            seq = arange(downsampled_without_padding.shape[0], device = device)
-
-            repeated_indices = torch.repeat_interleave(seq, chunk_lens_without_padding, dim = 0)
-            upsampled = downsampled_without_padding[repeated_indices]
-
-            upsampled = rearrange(upsampled, '(b n) d -> b n d', b = batch)
-
-            if needs_grad and apply_scale:
-                upsampled = multiply('b n d, b n', upsampled, upsampler_output_scale)
-
-            if self.handle_residual_proj:
-                upsampled = upsampled + self.residual_proj(residual)
-
-            upsampled = frac_gradient(upsampled, 1. / self.learning_rate_difference)
-
-            return upsampled
+            return self.upsample(downsampled, intermediates, apply_scale = apply_scale)
 
         # adjust learning rate
 
@@ -235,8 +251,6 @@ class DynamicChunkingDownsampler(Module):
         # returning
 
         outputs = Outputs(smoothed_downsampled_tokens, upsample, aux_loss)
-
-        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, upsampler_output_scale)
 
         if not return_intermediates:
             return outputs
