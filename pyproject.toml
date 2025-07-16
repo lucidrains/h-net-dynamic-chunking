@@ -43,3 +43,6 @@ test = [
 pythonpath = [
   "."
 ]
+
+[tool.setuptools.packages.find]
+include = ["h_net_dynamic_chunking*"]
