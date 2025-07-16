@@ -135,7 +135,7 @@ class DynamicSequenceChunker(Module):
         if self.handle_residual_proj:
             upsampled = upsampled + self.residual_proj(residual)
 
-        upsampled = frac_gradient(upsampled, 1. / self.learning_rate_difference)
+        upsampled = frac_gradient(upsampled, self.learning_rate_difference)
 
         return upsampled
 
@@ -249,7 +249,7 @@ class DynamicSequenceChunker(Module):
 
         # adjust learning rate
 
-        smoothed_downsampled_tokens = frac_gradient(smoothed_downsampled_tokens, self.learning_rate_difference)
+        smoothed_downsampled_tokens = frac_gradient(smoothed_downsampled_tokens, self.learning_rate_difference ** -1)
 
         # returning
 
