@@ -36,6 +36,7 @@ Repository = "https://github.com/lucidrains/h-net-dynamic-chunking"
 [project.optional-dependencies]
 examples = [
     "local-attention>=1.11.2",
+    "simplicial-attention>=0.1.5",
     "tqdm"
 ]
 test = [

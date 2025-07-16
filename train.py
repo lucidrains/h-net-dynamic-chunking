@@ -12,8 +12,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from einops import rearrange
-from local_attention import LocalTransformer
+
 from h_net_dynamic_chunking import HNet
+from local_attention import LocalTransformer
+
+# Roy et al. - https://arxiv.org/abs/2507.02754
+
+from simplicial_attention.two_simplicial_transformer import TwoSimplicialTransformer
 
 # constants
 
@@ -94,14 +99,16 @@ class HNetLM(Module):
             **transformer_kwargs
         )
 
-        network = LocalTransformer(
-            num_tokens = None,
+        network = TwoSimplicialTransformer(
             dim = dim_inner,
             depth = depth,
             dim_head = dim_head,
             heads = heads,
-            max_seq_len = max_seq_len,
-            local_attn_window_size = inner_window_size,
+            two_simplicial_attn_every = 1, # every layer
+            attn_kwargs = dict(
+                w1 = window_size * 2,
+                w2 = window_size
+            ),
             **transformer_kwargs
         )
 
@@ -180,9 +187,9 @@ model = HNetLM(
     num_tokens = 256,
     dim = 256,
     dim_inner = 512,
-    enc_depth = 1,
-    depth = 4,
-    dec_depth = 1,
+    enc_depth = 3,
+    depth = 2,
+    dec_depth = 3,
 ).cuda()
 
 # prepare enwik8 data
