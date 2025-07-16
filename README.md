@@ -54,6 +54,53 @@ downsampled3, upsample_fn3, aux_loss3 = downsampler3(downsampled2)
 assert upsample_fn1(upsample_fn2(upsample_fn3(downsampled3))).shape == tokens.shape
 ```
 
+HNet wrapper
+
+```python
+import torch
+from torch import nn
+from h_net_dynamic_chunking.h_net import HNet
+
+# 3 hierarchies, from 512 -> 1024, -> 2048 inner
+
+net = HNet(
+    nn.Identity(),
+    HNet(
+        nn.Identity(),
+        HNet(
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            dim = 2048
+        ),
+        nn.Identity(),
+        dim = 1024,
+        dim_inner = 2048
+    ),
+    nn.Identity(),
+    dim = 512,
+    dim_inner = 1024,
+)
+
+tokens = torch.randn(1, 1024, 512)
+
+out, aux_loss = net(tokens) # (1, 1024, 512), (1,)
+```
+
+## Example
+
+Enwik8 with 2 hierarchies
+
+```shell
+$ pip install '.[examples]'
+```
+
+Then
+
+```shell
+$ python train.py
+```
+
 ## Citations
 
 ```bibtex

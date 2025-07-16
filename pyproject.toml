@@ -1,6 +1,6 @@
 [project]
 name = "h-net-dynamic-chunking"
-version = "0.0.19"
+version = "0.1.0"
 description = "H-Net Dynamic Chunking Modules"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -35,7 +35,8 @@ Repository = "https://github.com/lucidrains/h-net-dynamic-chunking"
 
 [project.optional-dependencies]
 examples = [
-    "local-attention"
+    "local-attention>=1.11.2",
+    "tqdm"
 ]
 test = [
     "pytest"
