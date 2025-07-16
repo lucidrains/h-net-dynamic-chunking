@@ -1,6 +1,6 @@
 [project]
 name = "h-net-dynamic-chunking"
-version = "0.0.18"
+version = "0.0.19"
 description = "H-Net Dynamic Chunking Modules"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

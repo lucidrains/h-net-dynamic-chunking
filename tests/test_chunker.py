@@ -31,14 +31,15 @@ def test_hnet():
                 nn.Identity(),
                 nn.Identity(),
                 nn.Identity(),
-                dim = 512
+                dim = 2048
             ),
             nn.Identity(),
-            dim = 512
+            dim = 1024,
+            dim_inner = 2048
         ),
         nn.Identity(),
         dim = 512,
-        handle_residual_proj = True
+        dim_inner = 1024,
     )
 
     tokens = torch.randn(1, 1024, 512)
