@@ -1,1 +1,3 @@
 from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicSequenceChunker
+
+from h_net_dynamic_chunking.h_net import HNet
