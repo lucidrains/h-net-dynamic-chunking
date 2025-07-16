@@ -1,6 +1,6 @@
 <img src="./h-net.png" width="450px"></img>
 
-## H-Net Dynamic Chunking (wip)
+## H-Net Dynamic Chunking
 
 Implementation of the dynamic chunking mechanism in [H-net](https://arxiv.org/abs/2507.07955) by Hwang et al. of Carnegie Mellon
 
