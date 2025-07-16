@@ -48,21 +48,29 @@ class HNet(Module):
 
     def forward(
         self,
-        tokens
+        tokens,
+        intermediates = None,
+        return_intermediates = False
     ):
 
         encoded = self.encoder(tokens)
 
-        downsampled, upsample, aux_ratio_loss = self.dynamic_sequence_chunker(encoded)
+        (downsampled, upsample, aux_ratio_loss), intermediate = self.dynamic_sequence_chunker(encoded, return_intermediates = True)
 
         downsampled = self.proj_in(downsampled)
 
-        inner_hierarchy_out = self.network(downsampled)
+        is_nested_hnet = isinstance(self.network, HNet)
 
-        if isinstance(self.network, HNet):
-            inner_network_output, maybe_inner_aux_ratio_loss = inner_hierarchy_out
+        network_kwargs = dict(return_intermediates = True) if is_nested_hnet else dict()
+
+        inner_hierarchy_out = self.network(downsampled, **network_kwargs)
+
+        if is_nested_hnet:
+            inner_network_output, maybe_inner_aux_ratio_loss, inner_intermediates = inner_hierarchy_out
         else:
             inner_network_output = inner_hierarchy_out
+
+            inner_intermediates = ()
             maybe_inner_aux_ratio_loss = self.zero
 
         inner_network_output = self.proj_out(inner_network_output)
@@ -71,4 +79,11 @@ class HNet(Module):
 
         output = self.decoder(upsampled)
 
-        return output, aux_ratio_loss + maybe_inner_aux_ratio_loss
+        total_loss = aux_ratio_loss + maybe_inner_aux_ratio_loss
+
+        output_with_loss = (output, total_loss)
+
+        if not return_intermediates:
+            return output_with_loss
+
+        return (*output_with_loss, (intermediate, *inner_intermediates))

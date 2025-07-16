@@ -22,6 +22,7 @@ def test_chunker(
 def test_hnet():
     from torch import nn
     from h_net_dynamic_chunking.h_net import HNet
+    from h_net_dynamic_chunking.h_net_dynamic_chunking import Intermediates
 
     net = HNet(
         nn.Identity(),
@@ -44,5 +45,8 @@ def test_hnet():
 
     tokens = torch.randn(1, 1024, 512)
 
-    out, aux_loss = net(tokens)
+    out, aux_loss = net(tokens) # (1, 1024, 512), (1,)
     assert aux_loss.numel() == 1
+
+    net, aux_loss, intermediates = net(tokens, return_intermediates = True)
+    assert all(isinstance(el, Intermediates) for el in intermediates)
