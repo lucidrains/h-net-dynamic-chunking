@@ -18,7 +18,7 @@ from assoc_scan import AssocScan
 Outputs = namedtuple('Outputs', [
     'downsampled',
     'upsample_fn',
-    'aux_loss'
+    'weighted_aux_ratio_loss'
 ])
 
 Intermediates = namedtuple('Intermediates', [
@@ -27,7 +27,8 @@ Intermediates = namedtuple('Intermediates', [
     'chunk_lens',
     'boundary_mask',
     'residual',
-    'upsampler_output_scale'
+    'upsampler_output_scale',
+    'aux_ratio_loss'
 ])
 
 # helper functions
@@ -207,8 +208,8 @@ class DynamicSequenceChunker(Module):
         # defaults if not training
 
         upsampler_output_scale = None
-        aux_ratio_loss = self.zero
         aux_loss = self.zero
+        weighted_aux_loss = self.zero
 
         needs_grad = tokens.requires_grad
 
@@ -235,11 +236,12 @@ class DynamicSequenceChunker(Module):
 
             aux_ratio_loss = N / (N - 1) * ((N - 1) * F * G + (1. - F) * (1. - G))
 
-            aux_loss = aux_ratio_loss.mean() * self.ratio_loss_weight
+            aux_loss = aux_ratio_loss.mean()
+            weighted_aux_loss = aux_loss * self.ratio_loss_weight
 
         # intermediates
 
-        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, residual, upsampler_output_scale)
+        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, residual, upsampler_output_scale, aux_loss)
 
         # return the upsample function
 
@@ -253,7 +255,7 @@ class DynamicSequenceChunker(Module):
 
         # returning
 
-        outputs = Outputs(smoothed_downsampled_tokens, upsample, aux_loss)
+        outputs = Outputs(smoothed_downsampled_tokens, upsample, weighted_aux_loss)
 
         if not return_intermediates:
             return outputs
