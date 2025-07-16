@@ -40,6 +40,13 @@ def default(v, d):
 def straight_through(t, value):
     return t + (value - t).detach()
 
+def frac_gradient(t, frac = 1.):
+    if frac == 1:
+        return
+
+    t_grad = t * frac
+    return straight_through(t_grad, t)
+
 # classes
 
 class DynamicChunkingDownsampler(Module):
@@ -52,6 +59,7 @@ class DynamicChunkingDownsampler(Module):
         ratio_loss_weight = 3e-2,
         handle_residual_proj = False,       # turning this on will automatically handle a projection of the residual and its application in the inverse upsample function
         assoc_scan_use_accelerated = False,
+        learning_rate_difference = 0.75,    # in the paper, they report that as one moves up a hierarchy, the learning rate needs to decrease. we'll default to 0.75 for the rough 2.0 -> 1.5 somewhere in the appendix from level 0 -> 1
         straight_through_frac_vecs = True,  # improvisation where F receives gradients through straight-through with sigmoid
     ):
         super().__init__()
@@ -81,6 +89,11 @@ class DynamicChunkingDownsampler(Module):
 
         if handle_residual_proj:
             self.residual_proj = Linear(dim, dim)
+
+        # learning rate modulation, appendix C
+        # the multiplier on the learning rate as one goes from outer to inner of the h-net, and inverse of this value from inner to outer
+
+        self.learning_rate_difference = learning_rate_difference
 
         # ratio aux loss related
 
@@ -211,7 +224,13 @@ class DynamicChunkingDownsampler(Module):
             if self.handle_residual_proj:
                 upsampled = upsampled + self.residual_proj(residual)
 
+            upsampled = frac_gradient(upsampled, 1. / self.learning_rate_difference)
+
             return upsampled
+
+        # adjust learning rate
+
+        smoothed_downsampled_tokens = frac_gradient(smoothed_downsampled_tokens, self.learning_rate_difference)
 
         # returning
 
