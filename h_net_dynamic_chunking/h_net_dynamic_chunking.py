@@ -143,7 +143,8 @@ class DynamicSequenceChunker(Module):
     def forward(
         self,
         tokens, # float[b n d],
-        return_intermediates = False
+        return_intermediates = False,
+        return_only_chunk_lens = False
     ):
         batch, length, device = *tokens.shape[:2], tokens.device
 
@@ -180,6 +181,11 @@ class DynamicSequenceChunker(Module):
 
         chunk_lens = sel_indices[:, 1:] - sel_indices[:, :-1]
         chunk_lens.masked_fill_(~mask, 0)
+
+        # early return chunk lens if using a trained module as a tokenizer
+
+        if return_only_chunk_lens:
+            return chunk_lens
 
         # downsampling - they show in their experiments that picking out the boundary tokens works just fine
 
