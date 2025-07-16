@@ -26,6 +26,7 @@ Intermediates = namedtuple('Intermediates', [
     'probs',
     'chunk_lens',
     'boundary_mask',
+    'residual',
     'upsampler_output_scale'
 ])
 
@@ -111,10 +112,10 @@ class DynamicChunkingDownsampler(Module):
         intermediates: Intermediates,
         apply_scale = True
     ):
-        batch, needs_grad = downsampled.shape[0], downsampled.requires_grad
+        batch, needs_grad, device = downsampled.shape[0], downsampled.requires_grad, downsampled.device
 
-        device = downsampled.device
         mask = intermediates.mask
+        residual = intermediates.residual
 
         downsampled_without_padding = downsampled[mask]
         chunk_lens_without_padding = intermediates.chunk_lens[mask]
@@ -236,7 +237,7 @@ class DynamicChunkingDownsampler(Module):
 
         # intermediates
 
-        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, upsampler_output_scale)
+        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, residual, upsampler_output_scale)
 
         # return the upsample function
 
