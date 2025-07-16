@@ -34,7 +34,9 @@ Homepage = "https://pypi.org/project/h-net-dynamic-chunking/"
 Repository = "https://github.com/lucidrains/h-net-dynamic-chunking"
 
 [project.optional-dependencies]
-examples = []
+examples = [
+    "local-attention"
+]
 test = [
     "pytest"
 ]
