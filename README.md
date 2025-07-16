@@ -14,9 +14,9 @@ $ pip install h-net-dynamic-chunking
 
 ```python
 import torch
-from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicChunkingDownsampler
+from h_net_dynamic_chunking import DynamicSequenceChunker
 
-downsampler = DynamicChunkingDownsampler(512)
+downsampler = DynamicSequenceChunker(512)
 
 tokens = torch.randn(3, 1024, 512).requires_grad_()
 
@@ -29,11 +29,11 @@ assert upsample_fn(downsampled).shape == tokens.shape
 
 ```python
 import torch
-from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicChunkingDownsampler
+from h_net_dynamic_chunking import DynamicSequenceChunker
 
-downsampler1 = DynamicChunkingDownsampler(512)
-downsampler2 = DynamicChunkingDownsampler(512)
-downsampler3 = DynamicChunkingDownsampler(512)
+downsampler1 = DynamicSequenceChunker(512)
+downsampler2 = DynamicSequenceChunker(512)
+downsampler3 = DynamicSequenceChunker(512)
 
 tokens = torch.randn(3, 1024, 512).requires_grad_()
 

@@ -50,7 +50,7 @@ def frac_gradient(t, frac = 1.):
 
 # classes
 
-class DynamicChunkingDownsampler(Module):
+class DynamicSequenceChunker(Module):
     def __init__(
         self,
         dim,
@@ -127,8 +127,10 @@ class DynamicChunkingDownsampler(Module):
 
         upsampled = rearrange(upsampled, '(b n) d -> b n d', b = batch)
 
-        if needs_grad and apply_scale:
-            upsampled = multiply('b n d, b n', upsampled, intermediates.upsampler_output_scale)
+        scale = intermediates.upsampler_output_scale
+
+        if needs_grad and apply_scale and exists(scale):
+            upsampled = multiply('b n d, b n', upsampled, scale)
 
         if self.handle_residual_proj:
             upsampled = upsampled + self.residual_proj(residual)
@@ -204,7 +206,7 @@ class DynamicChunkingDownsampler(Module):
 
         # defaults if not training
 
-        upsampler_output_scale = 1.
+        upsampler_output_scale = None
         aux_ratio_loss = self.zero
         aux_loss = self.zero
 
