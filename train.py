@@ -72,7 +72,8 @@ class HNetLM(Module):
         enc_depth,
         depth,
         dec_depth,
-        window_size = 64,
+        window_size = 32,
+        inner_window_size = 256,
         max_seq_len = SEQ_LEN,
         dim_head = 64,
         heads = 8,
@@ -89,6 +90,7 @@ class HNetLM(Module):
             dim_head = dim_head,
             heads = heads,
             max_seq_len = max_seq_len,
+            local_attn_window_size = window_size,
             **transformer_kwargs
         )
 
@@ -99,6 +101,7 @@ class HNetLM(Module):
             dim_head = dim_head,
             heads = heads,
             max_seq_len = max_seq_len,
+            local_attn_window_size = inner_window_size,
             **transformer_kwargs
         )
 
@@ -109,6 +112,7 @@ class HNetLM(Module):
             dim_head = dim_head,
             heads = heads,
             max_seq_len = max_seq_len,
+            local_attn_window_size = window_size,
             **transformer_kwargs
         )
 
