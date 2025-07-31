@@ -61,7 +61,7 @@ import torch
 from torch import nn
 from h_net_dynamic_chunking.h_net import HNet
 
-# 3 hierarchies, from 512 -> 1024, -> 2048 inner
+# 3 hierarchies, from 512 -> 1024 -> 2048 inner
 
 net = HNet(
     nn.Identity(),

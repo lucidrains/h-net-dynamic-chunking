@@ -50,3 +50,28 @@ def test_hnet():
 
     net, aux_loss, intermediates = net(tokens, return_intermediates = True)
     assert all(isinstance(el, Intermediates) for el in intermediates)
+
+def test_multihead_hnet():
+    from h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
+
+    downsampler1 = MultiHeadDynamicSequenceChunker(512, heads = 4)
+    downsampler2 = MultiHeadDynamicSequenceChunker(512, heads = 4)
+    downsampler3 = MultiHeadDynamicSequenceChunker(512, heads = 4)
+
+    tokens = torch.randn(3, 1024, 512).requires_grad_()
+
+    downsampled1, upsample_fn1, aux_loss1 = downsampler1(tokens)
+
+    # hierarchical network 1 ...
+
+    downsampled2, upsample_fn2, aux_loss2 = downsampler2(downsampled1)
+
+    # hierarchical network 2 ...
+
+    downsampled3, upsample_fn3, aux_loss3 = downsampler3(downsampled2)
+
+    # inner most network
+
+    # reconstituting
+
+    assert upsample_fn1(upsample_fn2(upsample_fn3(downsampled3))).shape == tokens.shape
