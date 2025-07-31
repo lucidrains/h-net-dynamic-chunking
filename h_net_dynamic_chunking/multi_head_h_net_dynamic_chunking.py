@@ -83,11 +83,15 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         self.heads_merged_with_batch = heads_merged_with_batch
 
-        if heads > 1 and concat_heads:
+        if heads == 1:
+            self.combine_heads = nn.Identity()
+
+        elif concat_heads:
             self.combine_heads = Sequential(
                 Rearrange('(h b) ... d -> b ... (h d)', h = heads),
                 Linear(dim * heads, dim)
             )
+
         else:
             self.combine_heads = Reduce('(h b) n d -> b n d', 'sum', h = heads)
 
