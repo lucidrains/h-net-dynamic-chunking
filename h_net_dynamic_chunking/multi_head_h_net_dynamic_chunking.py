@@ -137,12 +137,12 @@ class MultiHeadDynamicSequenceChunker(Module):
         intermediates: Intermediates,
         apply_scale = True
     ):
-        batch, needs_grad, device, heads = downsampled.shape[0], downsampled.requires_grad, downsampled.device, self.heads
-
         # split the heads back out if needed
 
         if not self.heads_merged_with_batch:
-            downsampled = rearrange(downsampled, 'h b ... -> (h b) ...', h = heads)
+            downsampled = rearrange(downsampled, 'h b ... -> (h b) ...', h = self.heads)
+
+        batch, needs_grad, device = downsampled.shape[0], downsampled.requires_grad, downsampled.device
 
         # get the mask and residual from downsample steps
 

@@ -75,3 +75,26 @@ def test_multihead_hnet():
     # reconstituting
 
     assert upsample_fn1(upsample_fn2(upsample_fn3(downsampled3))).shape == tokens.shape
+
+def test_two_inner_networks():
+
+    from torch.nn import GRU, LSTM
+    from h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
+
+    downsampler = MultiHeadDynamicSequenceChunker(512, heads = 2, heads_merged_with_batch = False)
+
+    tokens = torch.randn(3, 1024, 512).requires_grad_()
+
+    downsampled, upsample_fn, aux_loss = downsampler(tokens)
+
+    network1 = GRU(512, 512, batch_first = True)
+    network2 = LSTM(512, 512, batch_first = True)
+
+    first_head, second_head = downsampled
+
+    out1, _ = network1(first_head)
+    out2, _ = network2(second_head)
+
+    # reconstituting
+
+    assert upsample_fn([out1, out2]).shape == tokens.shape
