@@ -5,7 +5,7 @@ from collections import namedtuple
 import torch
 from torch import cat, arange
 from torch.nested import nested_tensor
-from torch.nn import Module, Linear, Parameter, Sequential
+from torch.nn import Module, Linear, Parameter, Sequential, RMSNorm
 from torch.nn.functional import cosine_similarity, pad
 
 from einx import multiply
@@ -29,6 +29,7 @@ Intermediates = namedtuple('Intermediates', [
     'boundary_mask',
     'residual',
     'upsampler_output_scale',
+    'input_downsampled_tokens',
     'aux_ratio_loss'
 ])
 
@@ -39,6 +40,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def identity(t):
+    return t
 
 def straight_through(t, value):
     return t + (value - t).detach()
@@ -67,6 +71,8 @@ class MultiHeadDynamicSequenceChunker(Module):
         assoc_scan_use_accelerated = False,
         learning_rate_difference = 0.75,    # in the paper, they report that as one moves up a hierarchy, the learning rate needs to decrease. we'll default to 0.75 for the rough 2.0 -> 1.5 somewhere in the appendix from level 0 -> 1
         straight_through_frac_vecs = True,  # improvisation where F receives gradients through straight-through with sigmoid
+        add_hier_ar_loss = False,            # "hierarchical autoregressive" loss - just an extra projection at the end and made to predict the next input token
+        detach_hier_target = True,
     ):
         super().__init__()
         dim_queries_keys = default(dim_queries_keys, dim)
@@ -129,6 +135,19 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         self.ratio_loss_weight = ratio_loss_weight
 
+        # maybe hierarchical loss
+
+        self.add_hier_ar_loss = add_hier_ar_loss
+        self.detach_hier_target = detach_hier_target
+
+        if add_hier_ar_loss:
+            self.to_hier_ar_pred = Sequential(
+                RMSNorm(dim),
+                Linear(dim, dim)
+            )
+
+        # zero
+
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
     def upsample(
@@ -137,6 +156,7 @@ class MultiHeadDynamicSequenceChunker(Module):
         intermediates: Intermediates,
         apply_scale = True
     ):
+
         # split the heads back out if needed
 
         if not self.heads_merged_with_batch:
@@ -144,10 +164,24 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         batch, needs_grad, device = downsampled.shape[0], downsampled.requires_grad, downsampled.device
 
-        # get the mask and residual from downsample steps
-
         mask = intermediates.mask
         residual = intermediates.residual
+
+        # handle maybe hierarchical autoregressive loss
+
+        if self.add_hier_ar_loss:
+
+            hier_pred = self.to_hier_ar_pred(downsampled[:, :-1])
+            hier_target = intermediates.input_downsampled_tokens[:, 1:]
+            hier_pred_mask = mask[:, 1:]
+
+            maybe_detach = torch.detach if self.detach_hier_target else identity
+
+            ar_loss = 1. - cosine_similarity(hier_pred, maybe_detach(hier_target), dim = -1)
+
+            ar_loss = ar_loss[hier_pred_mask].mean()
+
+        # get the mask and residual from downsample steps
 
         downsampled_without_padding = downsampled[mask]
         chunk_lens_without_padding = intermediates.chunk_lens[mask]
@@ -173,7 +207,10 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         upsampled = frac_gradient(upsampled, self.learning_rate_difference)
 
-        return upsampled
+        if not self.add_hier_ar_loss:
+            return upsampled
+
+        return upsampled, ar_loss
 
     def forward(
         self,
@@ -294,7 +331,7 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         # intermediates
 
-        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, residual, upsampler_output_scale, aux_loss)
+        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, residual, upsampler_output_scale, smoothed_downsampled_tokens, aux_loss)
 
         # return the upsample function
 

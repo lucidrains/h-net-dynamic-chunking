@@ -98,3 +98,35 @@ def test_two_inner_networks():
     # reconstituting
 
     assert upsample_fn([out1, out2]).shape == tokens.shape
+
+
+def test_hierarchial_ar_loss():
+    from h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
+
+    downsampler1 = MultiHeadDynamicSequenceChunker(512, heads = 2)
+    downsampler2 = MultiHeadDynamicSequenceChunker(512, heads = 2, add_hier_ar_loss = True)
+    downsampler3 = MultiHeadDynamicSequenceChunker(512, heads = 2)
+
+    tokens = torch.randn(3, 1024, 512).requires_grad_()
+
+    downsampled1, upsample_fn1, aux_loss1 = downsampler1(tokens)
+
+    # hierarchical network 1 ...
+
+    downsampled2, upsample_fn2, aux_loss2 = downsampler2(downsampled1)
+
+    # hierarchical network 2 ...
+
+    downsampled3, upsample_fn3, aux_loss3 = downsampler3(downsampled2)
+
+    # inner most network
+
+    # reconstituting
+
+    upsampled3 = upsample_fn3(downsampled3)
+
+    upsampled2, hier_ar_loss2 = upsample_fn2(upsampled3)
+
+    upsampled = upsample_fn1(upsampled2)
+
+    assert hier_ar_loss2.numel() == 1
