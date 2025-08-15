@@ -27,6 +27,7 @@ Intermediates = namedtuple('Intermediates', [
     'chunk_lens',
     'boundary_mask',
     'residual',
+    'gates',
     'upsampler_output_scale',
     'aux_ratio_loss'
 ])
@@ -116,7 +117,14 @@ class DynamicSequenceChunker(Module):
         batch, needs_grad, device = downsampled.shape[0], downsampled.requires_grad, downsampled.device
 
         mask = intermediates.mask
+        gates = intermediates.gates
         residual = intermediates.residual
+
+        # smoothing module for improved gradients eq(5)
+
+        downsampled = self.smooth_assoc_scan(gates, downsampled)
+
+        # upsample
 
         downsampled_without_padding = downsampled[mask]
         chunk_lens_without_padding = intermediates.chunk_lens[mask]
@@ -205,8 +213,6 @@ class DynamicSequenceChunker(Module):
 
         downsampled_tokens = multiply('b n d, b n', downsampled_tokens, boundary_probs)
 
-        smoothed_downsampled_tokens = self.smooth_assoc_scan(gates, downsampled_tokens)
-
         # for the upsampler
 
         confidence = torch.where(boundary_mask, probs, 1. - probs)
@@ -247,7 +253,7 @@ class DynamicSequenceChunker(Module):
 
         # intermediates
 
-        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, residual, upsampler_output_scale, aux_loss)
+        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, residual, gates, upsampler_output_scale, aux_loss)
 
         # return the upsample function
 
@@ -257,11 +263,11 @@ class DynamicSequenceChunker(Module):
 
         # adjust learning rate
 
-        smoothed_downsampled_tokens = frac_gradient(smoothed_downsampled_tokens, self.learning_rate_difference ** -1)
+        downsampled_tokens = frac_gradient(downsampled_tokens, self.learning_rate_difference ** -1)
 
         # returning
 
-        outputs = Outputs(smoothed_downsampled_tokens, upsample, weighted_aux_loss)
+        outputs = Outputs(downsampled_tokens, upsample, weighted_aux_loss)
 
         if not return_intermediates:
             return outputs

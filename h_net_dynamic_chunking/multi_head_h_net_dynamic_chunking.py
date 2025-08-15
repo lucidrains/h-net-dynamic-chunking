@@ -27,6 +27,7 @@ Intermediates = namedtuple('Intermediates', [
     'probs',
     'chunk_lens',
     'boundary_mask',
+    'gates',
     'residual',
     'upsampler_output_scale',
     'input_downsampled_tokens',
@@ -165,6 +166,7 @@ class MultiHeadDynamicSequenceChunker(Module):
         batch, needs_grad, device = downsampled.shape[0], downsampled.requires_grad, downsampled.device
 
         mask = intermediates.mask
+        gates = intermediates.gates
         residual = intermediates.residual
 
         # handle maybe hierarchical autoregressive loss
@@ -180,6 +182,10 @@ class MultiHeadDynamicSequenceChunker(Module):
             ar_loss = 1. - cosine_similarity(hier_pred, maybe_detach(hier_target), dim = -1)
 
             ar_loss = ar_loss[hier_pred_mask].mean()
+
+        # smoothing module for improved gradients eq(5)
+
+        downsampled = self.smooth_assoc_scan(gates, downsampled)
 
         # get the mask and residual from downsample steps
 
@@ -279,8 +285,6 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         downsampled_tokens = tokens_nt.to_padded_tensor(padding = 0.)
 
-        # smoothing module for improved gradients eq(5)
-
         probs_nt = nested_tensor(probs[boundary_mask].split(num_chunks.tolist()), layout = torch.jagged, device = device, requires_grad = True)
 
         boundary_probs = probs_nt.to_padded_tensor(padding = 0.)
@@ -288,8 +292,6 @@ class MultiHeadDynamicSequenceChunker(Module):
         gates = 1. - boundary_probs
 
         downsampled_tokens = multiply('b n d, b n', downsampled_tokens, boundary_probs)
-
-        smoothed_downsampled_tokens = self.smooth_assoc_scan(gates, downsampled_tokens)
 
         # for the upsampler
 
@@ -331,7 +333,7 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         # intermediates
 
-        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, residual, upsampler_output_scale, smoothed_downsampled_tokens, aux_loss)
+        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, gates, residual, upsampler_output_scale, downsampled_tokens, aux_loss)
 
         # return the upsample function
 
@@ -341,16 +343,16 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         # adjust learning rate
 
-        smoothed_downsampled_tokens = frac_gradient(smoothed_downsampled_tokens, self.learning_rate_difference ** -1)
+        downsampled_tokens = frac_gradient(downsampled_tokens, self.learning_rate_difference ** -1)
 
         # maybe split out heads
 
         if not self.heads_merged_with_batch:
-            smoothed_downsampled_tokens = rearrange(smoothed_downsampled_tokens, '(h b) ... -> h b ...', h = heads)
+            downsampled_tokens = rearrange(downsampled_tokens, '(h b) ... -> h b ...', h = heads)
 
         # returning
 
-        outputs = Outputs(smoothed_downsampled_tokens, upsample, weighted_aux_loss)
+        outputs = Outputs(downsampled_tokens, upsample, weighted_aux_loss)
 
         if not return_intermediates:
             return outputs
