@@ -5,7 +5,7 @@ from collections import namedtuple
 import torch
 from torch import cat, arange
 from torch.nested import nested_tensor
-from torch.nn import Module, Linear, Parameter, Sequential, RMSNorm
+from torch.nn import Module, Linear, Parameter, Sequential, RMSNorm, Identity
 from torch.nn.functional import cosine_similarity, pad
 
 from einx import multiply
@@ -91,7 +91,7 @@ class MultiHeadDynamicSequenceChunker(Module):
         self.heads_merged_with_batch = heads_merged_with_batch
 
         if heads == 1:
-            self.combine_heads = nn.Identity()
+            self.combine_heads = Identity()
 
         elif concat_heads:
             self.combine_heads = Sequential(
