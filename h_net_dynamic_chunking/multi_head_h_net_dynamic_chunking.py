@@ -50,7 +50,7 @@ def straight_through(t, value):
 
 def frac_gradient(t, frac = 1.):
     if frac == 1:
-        return
+        return t
 
     t_grad = t * frac
     return straight_through(t_grad, t)

@@ -5,6 +5,7 @@ from torch import nn, tensor
 from torch.nn import Module
 
 from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicSequenceChunker
+from h_net_dynamic_chunking.multi_head_h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
 
 # helpers
 
@@ -32,7 +33,10 @@ class HNet(Module):
         self.network = network
         self.decoder = decoder
 
-        self.dynamic_sequence_chunker = DynamicSequenceChunker(
+        heads = dynamic_sequence_chunking_kwargs.get('heads', 1)
+        chunker_klass = DynamicSequenceChunker if heads == 1 else MultiHeadDynamicSequenceChunker
+
+        self.dynamic_sequence_chunker = chunker_klass(
             dim = dim,
             handle_residual_proj = True,
             **dynamic_sequence_chunking_kwargs
@@ -77,9 +81,14 @@ class HNet(Module):
 
         upsampled = upsample(inner_network_output)
 
+        extra_loss = self.zero
+
+        if isinstance(upsampled, tuple):
+            upsampled, extra_loss = upsampled
+
         output = self.decoder(upsampled)
 
-        total_loss = aux_ratio_loss + maybe_inner_aux_ratio_loss
+        total_loss = aux_ratio_loss + maybe_inner_aux_ratio_loss + extra_loss
 
         output_with_loss = (output, total_loss)
 
