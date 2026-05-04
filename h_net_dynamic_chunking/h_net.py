@@ -4,6 +4,8 @@ import torch
 from torch import nn, tensor
 from torch.nn import Module
 
+from torch_einops_utils import exclusive_cumsum
+
 from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicSequenceChunker
 from h_net_dynamic_chunking.multi_head_h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
 
@@ -31,6 +33,7 @@ class HNet(Module):
         dim,
         dim_inner = None,
         vq: VectorQuantize | None = None,
+        inner_network_rel_pos_kwarg: str | None = None,
         **dynamic_sequence_chunking_kwargs
     ):
         super().__init__()
@@ -38,6 +41,8 @@ class HNet(Module):
         self.encoder = encoder
         self.network = network
         self.decoder = decoder
+
+        self.inner_network_rel_pos_kwarg = inner_network_rel_pos_kwarg
 
         heads = dynamic_sequence_chunking_kwargs.get('heads', 1)
         chunker_klass = DynamicSequenceChunker if heads == 1 else MultiHeadDynamicSequenceChunker
@@ -81,6 +86,13 @@ class HNet(Module):
         is_nested_hnet = isinstance(self.network, HNet)
 
         network_kwargs = dict(return_intermediates = True) if is_nested_hnet else dict()
+
+        # maybe pass boundary positions to inner network
+        # inspired by HealthFormer (https://www.medrxiv.org/content/10.64898/2026.03.25.26349262v1)
+
+        if exists(self.inner_network_rel_pos_kwarg):
+            boundary_positions = exclusive_cumsum(intermediate.chunk_lens)
+            network_kwargs[self.inner_network_rel_pos_kwarg] = boundary_positions
 
         # maybe quantize
 

@@ -183,3 +183,32 @@ def test_vq_and_fetch_indices_from_intermediates(use_vq):
         assert indices.ndim == 2
     else:
         assert not exists(indices)
+
+def test_inner_network_pos_kwarg():
+    from torch import nn
+    from x_transformers import Decoder
+    from h_net_dynamic_chunking.h_net import HNet
+
+    dim = 512
+    dim_inner = 256
+
+    inner_network = Decoder(
+        dim = dim_inner,
+        depth = 2,
+        heads = 4,
+        rotary_pos_emb = True
+    )
+
+    net = HNet(
+        nn.Identity(),
+        inner_network,
+        nn.Identity(),
+        dim = dim,
+        dim_inner = dim_inner,
+        inner_network_rel_pos_kwarg = 'pos'
+    )
+
+    tokens = torch.randn(2, 128, dim)
+    out, aux_loss = net(tokens)
+
+    assert out.shape == tokens.shape
