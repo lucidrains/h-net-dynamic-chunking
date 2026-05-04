@@ -70,6 +70,7 @@ class HNet(Module):
         tokens,
         return_intermediates = False
     ):
+        maybe_vq = self.vq
 
         encoded = self.encoder(tokens)
 
@@ -83,8 +84,10 @@ class HNet(Module):
 
         # maybe quantize
 
-        if exists(self.vq):
-            maybe_projected_downsampled, indices, commit_loss = self.vq(maybe_projected_downsampled)
+        maybe_commit_loss = self.zero
+
+        if exists(maybe_vq):
+            maybe_projected_downsampled, indices, commit_loss = maybe_vq(maybe_projected_downsampled)
 
         # the inner transformer working on temporal compressed selected boundary tokens
 
@@ -111,7 +114,7 @@ class HNet(Module):
 
         output = self.decoder(upsampled)
 
-        total_loss = aux_ratio_loss + maybe_inner_aux_ratio_loss + extra_loss
+        total_loss = aux_ratio_loss + maybe_inner_aux_ratio_loss + extra_loss + maybe_commit_loss
 
         output_with_loss = (output, total_loss)
 
@@ -120,7 +123,7 @@ class HNet(Module):
 
         # take care of adding the quantized indices
 
-        if exists(self.vq):
+        if exists(maybe_vq):
             intermediate = intermediate._replace(quantized_downsampled_indices = indices)
 
         intermediate_out = intermediate
