@@ -15,6 +15,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def cast_tuple(t):
+    return t if type(t) is tuple else (t,)
+
 # classes
 
 class HNet(Module):
@@ -53,7 +56,6 @@ class HNet(Module):
     def forward(
         self,
         tokens,
-        intermediates = None,
         return_intermediates = False
     ):
 
@@ -61,13 +63,13 @@ class HNet(Module):
 
         (downsampled, upsample, aux_ratio_loss), intermediate = self.dynamic_sequence_chunker(encoded, return_intermediates = True)
 
-        downsampled = self.proj_in(downsampled)
+        maybe_projected_downsampled = self.proj_in(downsampled)
 
         is_nested_hnet = isinstance(self.network, HNet)
 
         network_kwargs = dict(return_intermediates = True) if is_nested_hnet else dict()
 
-        inner_hierarchy_out = self.network(downsampled, **network_kwargs)
+        inner_hierarchy_out = self.network(maybe_projected_downsampled, **network_kwargs)
 
         if is_nested_hnet:
             inner_network_output, maybe_inner_aux_ratio_loss, inner_intermediates = inner_hierarchy_out
@@ -77,9 +79,9 @@ class HNet(Module):
             inner_intermediates = ()
             maybe_inner_aux_ratio_loss = self.zero
 
-        inner_network_output = self.proj_out(inner_network_output)
+        maybe_projected_inner_network_output = self.proj_out(inner_network_output)
 
-        upsampled = upsample(inner_network_output)
+        upsampled = upsample(maybe_projected_inner_network_output)
 
         extra_loss = self.zero
 
@@ -95,4 +97,9 @@ class HNet(Module):
         if not return_intermediates:
             return output_with_loss
 
-        return (*output_with_loss, (intermediate, *inner_intermediates))
+        intermediate_out = intermediate
+
+        if is_nested_hnet:
+            intermediate_out = (intermediate_out, *cast_tuple(inner_intermediates))
+
+        return (*output_with_loss, intermediate_out)

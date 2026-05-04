@@ -130,3 +130,23 @@ def test_hierarchial_ar_loss():
     upsampled = upsample_fn1(upsampled2)
 
     assert hier_ar_loss2.numel() == 1
+
+def test_access_downsampled_from_h_net_intermediate():
+    from torch import nn
+    from h_net_dynamic_chunking.h_net import HNet
+
+    net = HNet(
+        nn.Identity(),
+        nn.Linear(1024, 1024),
+        nn.Identity(),
+        dim = 512,
+        dim_inner = 1024,
+    )
+
+    tokens = torch.randn(1, 1024, 512)
+
+    out, aux_loss, intermediates = net(tokens, return_intermediates = True)
+
+    downsampled = intermediates.input_downsampled_tokens
+    batch, down_seq, dim = downsampled.shape
+    assert batch == 1 and dim == 512 and down_seq <= 1024
