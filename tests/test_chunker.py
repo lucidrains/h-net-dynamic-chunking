@@ -1,8 +1,9 @@
 import torch
 import pytest
+param = pytest.mark.parametrize
 
-@pytest.mark.parametrize('handle_residual_proj', (False, True))
-@pytest.mark.parametrize('straight_through_frac_vecs', (False, True))
+@param('handle_residual_proj', (False, True))
+@param('straight_through_frac_vecs', (False, True))
 def test_chunker(
     handle_residual_proj,
     straight_through_frac_vecs
@@ -150,3 +151,35 @@ def test_access_downsampled_from_h_net_intermediate():
     downsampled = intermediates.input_downsampled_tokens
     batch, down_seq, dim = downsampled.shape
     assert batch == 1 and dim == 512 and down_seq <= 1024
+
+@param('use_vq', (False, True))
+def test_vq_and_fetch_indices_from_intermediates(use_vq):
+    from torch import nn
+    from vector_quantize_pytorch import VectorQuantize
+    from h_net_dynamic_chunking.h_net import HNet, exists
+
+    vq = VectorQuantize(
+        dim = 1024,
+        codebook_size = 256,
+        use_cosine_sim = True
+    ) if use_vq else None
+
+    net = HNet(
+        nn.Identity(),
+        nn.Linear(1024, 1024),
+        nn.Identity(),
+        dim = 512,
+        dim_inner = 1024,
+        vq = vq
+    )
+
+    tokens = torch.randn(1, 1024, 512)
+    out, aux_loss, intermediates = net(tokens, return_intermediates = True)
+
+    indices = intermediates.quantized_downsampled_indices
+    
+    if use_vq:
+        assert exists(indices)
+        assert indices.ndim == 2
+    else:
+        assert not exists(indices)

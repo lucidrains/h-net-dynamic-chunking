@@ -30,8 +30,9 @@ Intermediates = namedtuple('Intermediates', [
     'residual',
     'upsampler_output_scale',
     'input_downsampled_tokens',
-    'aux_ratio_loss'
-])
+    'aux_ratio_loss',
+    'quantized_downsampled_indices'
+], defaults = (None,))
 
 # helper functions
 

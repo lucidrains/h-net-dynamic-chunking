@@ -7,6 +7,8 @@ from torch.nn import Module
 from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicSequenceChunker
 from h_net_dynamic_chunking.multi_head_h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
 
+from vector_quantize_pytorch import VectorQuantize
+
 # helpers
 
 def exists(v):
@@ -28,6 +30,7 @@ class HNet(Module):
         decoder: Module,
         dim,
         dim_inner = None,
+        vq: VectorQuantize | None = None,
         **dynamic_sequence_chunking_kwargs
     ):
         super().__init__()
@@ -45,11 +48,20 @@ class HNet(Module):
             **dynamic_sequence_chunking_kwargs
         )
 
+        # convenience, if hierarchical layer should have dimension expansion
+        # would make sense
+
         dim_inner = default(dim_inner, dim)
         need_proj = dim != dim_inner
 
         self.proj_in = nn.Linear(dim, dim_inner) if need_proj else nn.Identity()
         self.proj_out = nn.Linear(dim_inner, dim) if need_proj else nn.Identity()
+
+        # maybe do vector quantization
+        # just use own library
+
+        assert not exists(vq) or isinstance(vq, VectorQuantize)
+        self.vq = vq
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -69,7 +81,16 @@ class HNet(Module):
 
         network_kwargs = dict(return_intermediates = True) if is_nested_hnet else dict()
 
+        # maybe quantize
+
+        if exists(self.vq):
+            maybe_projected_downsampled, indices, commit_loss = self.vq(maybe_projected_downsampled)
+
+        # the inner transformer working on temporal compressed selected boundary tokens
+
         inner_hierarchy_out = self.network(maybe_projected_downsampled, **network_kwargs)
+
+        # maybe multiple hierarchies
 
         if is_nested_hnet:
             inner_network_output, maybe_inner_aux_ratio_loss, inner_intermediates = inner_hierarchy_out
@@ -96,6 +117,11 @@ class HNet(Module):
 
         if not return_intermediates:
             return output_with_loss
+
+        # take care of adding the quantized indices
+
+        if exists(self.vq):
+            intermediate = intermediate._replace(quantized_downsampled_indices = indices)
 
         intermediate_out = intermediate
 
