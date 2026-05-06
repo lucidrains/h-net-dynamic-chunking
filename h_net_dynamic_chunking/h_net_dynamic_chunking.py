@@ -3,12 +3,12 @@
 from collections import namedtuple
 
 import torch
-from torch import cat, arange
+from torch import cat, arange, tensor, repeat_interleave
 from torch.nested import nested_tensor
 from torch.nn import Module, Linear, Parameter
 from torch.nn.functional import cosine_similarity, pad
 
-from einx import multiply
+from einx import multiply, where
 from einops import repeat, rearrange
 
 from assoc_scan import AssocScan
@@ -108,13 +108,14 @@ class DynamicSequenceChunker(Module):
 
         self.ratio_loss_weight = ratio_loss_weight
 
-        self.register_buffer('zero', torch.tensor(0.), persistent = False)
+        self.register_buffer('zero', tensor(0.), persistent = False)
 
     def upsample(
         self,
         downsampled,
         intermediates: Intermediates,
-        apply_scale = True
+        apply_scale = True,
+        cache = None
     ):
         batch, needs_grad, device = downsampled.shape[0], downsampled.requires_grad, downsampled.device
 
@@ -124,19 +125,39 @@ class DynamicSequenceChunker(Module):
 
         # smoothing module for improved gradients eq(5)
 
-        downsampled = self.smooth_assoc_scan(gates, downsampled)
+        has_downsampled = downsampled.shape[1] > 0
+
+        if has_downsampled:
+            assoc_scan_prev = cache.pop('assoc_scan_prev', None) if exists(cache) else None
+
+            downsampled = self.smooth_assoc_scan(gates, downsampled, prev = assoc_scan_prev)
+
+            if exists(cache):
+                cache['assoc_scan_prev'] = downsampled[:, -1]
 
         # upsample
 
-        downsampled_without_padding = downsampled[mask]
-        chunk_lens_without_padding = intermediates.chunk_lens[mask]
+        if exists(cache):
+            seq_len = intermediates.boundary_mask.shape[1]
+            last_upsampled = cache.pop('last_upsampled', None)
 
-        seq = arange(downsampled_without_padding.shape[0], device = device)
+            if has_downsampled:
+                chunk_idx = intermediates.boundary_mask.long().cumsum(dim = -1) - 1
 
-        repeated_indices = torch.repeat_interleave(seq, chunk_lens_without_padding, dim = 0)
-        upsampled = downsampled_without_padding[repeated_indices]
+                upsampled = downsampled[arange(batch, device = device)[:, None], chunk_idx.clamp(min = 0)]
 
-        upsampled = rearrange(upsampled, '(b n) d -> b n d', b = batch)
+                if exists(last_upsampled):
+                    upsampled = where('b n, b d, b n d', chunk_idx < 0, last_upsampled, upsampled)
+
+            else:
+                assert exists(last_upsampled), 'first token must always be a boundary, so last_upsampled should exist'
+                upsampled = repeat(last_upsampled, 'b d -> b n d', n = seq_len)
+
+            cache['last_upsampled'] = upsampled[:, -1]
+
+        else:
+            upsampled = repeat_interleave(downsampled[mask], intermediates.chunk_lens[mask], dim = 0)
+            upsampled = rearrange(upsampled, '(b n) d -> b n d', b = batch)
 
         scale = intermediates.upsampler_output_scale
 
@@ -154,7 +175,8 @@ class DynamicSequenceChunker(Module):
         self,
         tokens, # float[b n d],
         return_intermediates = False,
-        return_only_chunk_lens = False
+        return_only_chunk_lens = False,
+        cache = None
     ):
         batch, length, device = *tokens.shape[:2], tokens.device
 
@@ -162,26 +184,35 @@ class DynamicSequenceChunker(Module):
 
         queries, keys = self.to_queries_keys(tokens).chunk(2, dim = -1)
 
-        start_keys = repeat(self.start_key_token, 'd -> b 1 d', b = batch)
+        is_first_step = not exists(cache) or 'prev_key' not in cache
 
-        keys = cat((start_keys, keys), dim = 1)
+        if is_first_step:
+            keys_to_prepend = repeat(self.start_key_token, 'd -> b 1 d', b = batch)
+        else:
+            keys_to_prepend = cache.pop('prev_key')
+
+        keys_for_sim = cat((keys_to_prepend, keys[:, :-1]), dim = 1)
+
+        if exists(cache):
+            cache['prev_key'] = keys[:, -1:]
 
         # each query looks at the previous key to determine if distance is greater than some threshold for determining a boundary exists (they use 0.5 as threshold)
 
-        cosine_sim  = cosine_similarity(queries, keys[:, :-1], dim = -1)
+        cosine_sim  = cosine_similarity(queries, keys_for_sim, dim = -1)
 
         probs = (1. - cosine_sim) * 0.5 # cosine sim is -1. to 1., this transforms it to 0. to 1.
 
         boundary_mask = probs > self.boundary_threshold # bool[b n]
 
-        boundary_mask[:, 0] = True # first token must always be boundary
+        if is_first_step:
+            boundary_mask[:, 0] = True # first token must always be boundary
 
         # compute some lengths, per chunk and number of chunks per batch
 
         num_chunks = boundary_mask.long().sum(dim = -1)
 
         boundary_mask_with_end = pad(boundary_mask, (0, 1), value = True)
-        sel_indices = repeat(arange(boundary_mask_with_end.shape[-1], device = device), 'n -> b n', b = batch)[boundary_mask_with_end]
+        sel_indices = boundary_mask_with_end.nonzero()[:, 1]
 
         sel_indices = nested_tensor(sel_indices.split((num_chunks + 1).tolist()), layout = torch.jagged, device = device)
 
@@ -199,21 +230,28 @@ class DynamicSequenceChunker(Module):
 
         # downsampling - they show in their experiments that picking out the boundary tokens works just fine
 
-        boundary_tokens = tokens[boundary_mask] # pick out boundary tokens
+        max_chunks = num_chunks.amax().item()
 
-        tokens_nt = nested_tensor(boundary_tokens.split(num_chunks.tolist()), layout = torch.jagged, device = device, requires_grad = True)
+        if max_chunks == 0:
+            downsampled_tokens = tokens[:, 0:0]
+            gates = probs[:, 0:0]
 
-        downsampled_tokens = tokens_nt.to_padded_tensor(padding = 0.)
+        else:
+            boundary_tokens = tokens[boundary_mask] # pick out boundary tokens
 
-        # smoothing module for improved gradients eq(5)
+            tokens_nt = nested_tensor(boundary_tokens.split(num_chunks.tolist()), layout = torch.jagged, device = device, requires_grad = True)
 
-        probs_nt = nested_tensor(probs[boundary_mask].split(num_chunks.tolist()), layout = torch.jagged, device = device, requires_grad = True)
+            downsampled_tokens = tokens_nt.to_padded_tensor(padding = 0.)
 
-        boundary_probs = probs_nt.to_padded_tensor(padding = 0.)
+            # smoothing module for improved gradients eq(5)
 
-        gates = 1. - boundary_probs
+            probs_nt = nested_tensor(probs[boundary_mask].split(num_chunks.tolist()), layout = torch.jagged, device = device, requires_grad = True)
 
-        downsampled_tokens = multiply('b n d, b n', downsampled_tokens, boundary_probs)
+            boundary_probs = probs_nt.to_padded_tensor(padding = 0.)
+
+            gates = 1. - boundary_probs
+
+            downsampled_tokens = multiply('b n d, b n', downsampled_tokens, boundary_probs)
 
         # for the upsampler
 
@@ -259,9 +297,9 @@ class DynamicSequenceChunker(Module):
 
         # return the upsample function
 
-        def upsample(downsampled, apply_scale = True):
+        def upsample(downsampled, apply_scale = True, cache = None):
 
-            return self.upsample(downsampled, intermediates, apply_scale = apply_scale)
+            return self.upsample(downsampled, intermediates, apply_scale = apply_scale, cache = cache)
 
         # adjust learning rate
 
@@ -271,7 +309,4 @@ class DynamicSequenceChunker(Module):
 
         outputs = Outputs(downsampled_tokens, upsample, weighted_aux_loss)
 
-        if not return_intermediates:
-            return outputs
-
-        return outputs, intermediates
+        return (outputs, intermediates) if return_intermediates else outputs

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-import torch
+from collections import namedtuple
+
+import inspect
+
 from torch import nn, tensor
 from torch.nn import Module
 
@@ -10,6 +13,7 @@ from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicSequenceChunker
 from h_net_dynamic_chunking.multi_head_h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
 
 from vector_quantize_pytorch import VectorQuantize
+from x_transformers import Decoder
 
 # helpers
 
@@ -22,14 +26,33 @@ def default(v, d):
 def cast_tuple(t):
     return t if type(t) is tuple else (t,)
 
+def pick(d, *keys):
+    d = default(d, dict())
+    return tuple(d.get(k) for k in keys)
+
+# check if a module's forward accepts cache and return_hiddens kwargs
+
+def accepts_cache(module):
+    if isinstance(module, Decoder):
+        return True
+    sig = inspect.signature(module.forward).parameters
+    return 'cache' in sig and 'return_hiddens' in sig
+
 # classes
+
+HNetReturn = namedtuple('HNetReturn', [
+    'output',
+    'loss',
+    'intermediates',
+    'next_cache'
+])
 
 class HNet(Module):
     def __init__(
         self,
-        encoder: Module,
-        network: Module | HNet,
-        decoder: Module,
+        encoder: Module | dict,
+        network: Module | HNet | dict,
+        decoder: Module | dict,
         dim,
         dim_inner = None,
         vq: VectorQuantize | None = None,
@@ -38,14 +61,20 @@ class HNet(Module):
     ):
         super().__init__()
 
-        self.encoder = encoder
-        self.network = network
-        self.decoder = decoder
+        def instantiate(m):
+            return Decoder(**m) if isinstance(m, dict) else m
+
+        self.encoder = instantiate(encoder)
+        self.network = instantiate(network)
+        self.decoder = instantiate(decoder)
 
         self.inner_network_rel_pos_kwarg = inner_network_rel_pos_kwarg
 
-        heads = dynamic_sequence_chunking_kwargs.get('heads', 1)
+        heads = dynamic_sequence_chunking_kwargs.pop('heads', 1)
         chunker_klass = DynamicSequenceChunker if heads == 1 else MultiHeadDynamicSequenceChunker
+
+        if heads > 1:
+            dynamic_sequence_chunking_kwargs['heads'] = heads
 
         self.dynamic_sequence_chunker = chunker_klass(
             dim = dim,
@@ -70,22 +99,58 @@ class HNet(Module):
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
-    def forward(
-        self,
-        tokens,
-        return_intermediates = False
-    ):
-        maybe_vq = self.vq
-
-        encoded = self.encoder(tokens)
-
-        (downsampled, upsample, aux_ratio_loss), intermediate = self.dynamic_sequence_chunker(encoded, return_intermediates = True)
-
-        maybe_projected_downsampled = self.proj_in(downsampled)
+        # determine cache support for encoder, decoder, and inner network at init time
 
         is_nested_hnet = isinstance(self.network, HNet)
 
-        network_kwargs = dict(return_intermediates = True) if is_nested_hnet else dict()
+        self._is_nested_hnet = is_nested_hnet
+
+        self._encoder_accepts_cache = accepts_cache(self.encoder)
+        self._decoder_accepts_cache = accepts_cache(self.decoder)
+        self._inner_accepts_cache = is_nested_hnet or accepts_cache(self.network)
+        self._is_multi_head = heads > 1
+
+    def forward(
+        self,
+        tokens,
+        return_intermediates = False,
+        return_hiddens = False,
+        cache = None
+    ):
+        is_caching = exists(cache) or return_hiddens
+
+        assert not (self._is_multi_head and is_caching), 'caching is not yet supported for multi-head dynamic sequence chunking'
+
+
+        # unpack cache, ensuring we don't mutate the user's input cache
+
+        next_cache = dict()
+
+        chunker_cache, upsample_cache, encoder_cache, decoder_cache, inner_cache = pick(cache, 'chunker', 'upsample', 'encoder', 'decoder', 'inner')
+
+        if is_caching:
+            chunker_cache = default(chunker_cache, dict())
+            upsample_cache = default(upsample_cache, dict())
+
+        # encode
+
+        if self._encoder_accepts_cache and is_caching:
+            encoded, encoder_cache = self.encoder(tokens, cache = encoder_cache, return_hiddens = True)
+            next_cache['encoder'] = encoder_cache
+        else:
+            encoded = self.encoder(tokens)
+
+        # downsample via dynamic chunker
+
+        (downsampled, upsample, aux_ratio_loss), intermediate = self.dynamic_sequence_chunker(
+            encoded,
+            return_intermediates = True,
+            cache = chunker_cache
+        )
+
+        maybe_projected_downsampled = self.proj_in(downsampled)
+
+        network_kwargs = dict()
 
         # maybe pass boundary positions to inner network
         # inspired by HealthFormer (https://www.medrxiv.org/content/10.64898/2026.03.25.26349262v1)
@@ -98,49 +163,70 @@ class HNet(Module):
 
         maybe_commit_loss = self.zero
 
-        if exists(maybe_vq):
-            maybe_projected_downsampled, indices, commit_loss = maybe_vq(maybe_projected_downsampled)
+        if exists(self.vq):
+            maybe_projected_downsampled, indices, maybe_commit_loss = self.vq(maybe_projected_downsampled)
 
-        # the inner transformer working on temporal compressed selected boundary tokens
+        # inner network - skip if no boundaries this step (cache handles output)
 
-        inner_hierarchy_out = self.network(maybe_projected_downsampled, **network_kwargs)
+        has_tokens_for_inner = maybe_projected_downsampled.shape[1] > 0
 
-        # maybe multiple hierarchies
+        inner_intermediates = ()
+        maybe_inner_aux_ratio_loss = self.zero
 
-        if is_nested_hnet:
-            inner_network_output, maybe_inner_aux_ratio_loss, inner_intermediates = inner_hierarchy_out
+        if not has_tokens_for_inner:
+            inner_network_output = maybe_projected_downsampled
+
+        elif self._is_nested_hnet:
+            out = self.network(maybe_projected_downsampled, cache = inner_cache, return_hiddens = is_caching, return_intermediates = True)
+
+            inner_network_output = out.output
+            maybe_inner_aux_ratio_loss = out.loss
+            inner_cache = out.next_cache
+            inner_intermediates = out.intermediates
+
         else:
-            inner_network_output = inner_hierarchy_out
+            if self._inner_accepts_cache and is_caching:
+                inner_network_output, inner_cache = self.network(maybe_projected_downsampled, cache = inner_cache, return_hiddens = True, **network_kwargs)
+            else:
+                inner_network_output = self.network(maybe_projected_downsampled, **network_kwargs)
 
-            inner_intermediates = ()
-            maybe_inner_aux_ratio_loss = self.zero
+        if return_hiddens:
+            next_cache['inner'] = inner_cache
 
-        maybe_projected_inner_network_output = self.proj_out(inner_network_output)
-
-        upsampled = upsample(maybe_projected_inner_network_output)
+        upsampled = upsample(self.proj_out(inner_network_output), cache = upsample_cache)
 
         extra_loss = self.zero
 
         if isinstance(upsampled, tuple):
             upsampled, extra_loss = upsampled
 
-        output = self.decoder(upsampled)
+        # decode
+
+        if self._decoder_accepts_cache and is_caching:
+            output, decoder_cache = self.decoder(upsampled, cache = decoder_cache, return_hiddens = True)
+            next_cache['decoder'] = decoder_cache
+        else:
+            output = self.decoder(upsampled)
 
         total_loss = aux_ratio_loss + maybe_inner_aux_ratio_loss + extra_loss + maybe_commit_loss
 
-        output_with_loss = (output, total_loss)
+        if return_hiddens:
+            next_cache.update(
+                chunker = chunker_cache,
+                upsample = upsample_cache
+            )
 
-        if not return_intermediates:
-            return output_with_loss
-
-        # take care of adding the quantized indices
-
-        if exists(maybe_vq):
+        if exists(self.vq):
             intermediate = intermediate._replace(quantized_downsampled_indices = indices)
 
         intermediate_out = intermediate
 
-        if is_nested_hnet:
+        if self._is_nested_hnet:
             intermediate_out = (intermediate_out, *cast_tuple(inner_intermediates))
 
-        return (*output_with_loss, intermediate_out)
+        return HNetReturn(
+            output,
+            total_loss,
+            intermediate_out if return_intermediates else None,
+            next_cache if return_hiddens else None
+        )

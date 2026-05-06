@@ -1,3 +1,22 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "torch",
+#     "einops",
+#     "x-transformers",
+#     "accelerate",
+#     "tqdm",
+#     "numpy",
+#     "vector-quantize-pytorch",
+#     "torch-einops-utils",
+#     "fire",
+#     "assoc-scan",
+# ]
+# ///
+
+import fire
+
+import argparse
 import math
 import gzip
 import random
@@ -11,31 +30,20 @@ from torch.nn import Module
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from accelerate import Accelerator
+
 from einops import rearrange
 
 from h_net_dynamic_chunking import HNet
-from local_attention import LocalTransformer
-
-# Roy et al. - https://arxiv.org/abs/2507.02754
-
-from simplicial_attention.two_simplicial_transformer import TwoSimplicialTransformer
-
-# constants
-
-NUM_BATCHES = int(1e5)
-BATCH_SIZE = 4
-GRAD_ACCUM_EVERY = 4
-LEARNING_RATE = 1e-4
-VALIDATE_EVERY = 100
-PRIME_LENGTH = 32
-GENERATE_EVERY = 500
-GENERATE_LENGTH = 256
-SEQ_LEN = 512
+from x_transformers import Decoder
 
 # helpers
 
 def exists(v):
     return v is not None
+
+def divisible_by(num, den):
+    return (num % den) == 0
 
 def cycle(loader):
     while True:
@@ -77,9 +85,7 @@ class HNetLM(Module):
         enc_depth,
         depth,
         dec_depth,
-        window_size = 32,
-        inner_window_size = 256,
-        max_seq_len = SEQ_LEN,
+        max_seq_len = 512,
         dim_head = 64,
         heads = 8,
         transformer_kwargs = dict()
@@ -88,38 +94,27 @@ class HNetLM(Module):
         self.token_emb = nn.Embedding(num_tokens, dim)
         self.pos_emb = nn.Embedding(max_seq_len, dim)
 
-        encoder = LocalTransformer(
-            num_tokens = None,
+        encoder = Decoder(
             dim = dim,
             depth = enc_depth,
-            dim_head = dim_head,
+            attn_dim_head = dim_head,
             heads = heads,
-            max_seq_len = max_seq_len,
-            local_attn_window_size = window_size,
             **transformer_kwargs
         )
 
-        network = TwoSimplicialTransformer(
+        network = Decoder(
             dim = dim_inner,
             depth = depth,
-            dim_head = dim_head,
+            attn_dim_head = dim_head,
             heads = heads,
-            two_simplicial_attn_every = 1, # every layer
-            attn_kwargs = dict(
-                w1 = window_size * 2,
-                w2 = window_size
-            ),
             **transformer_kwargs
         )
 
-        decoder = LocalTransformer(
-            num_tokens = None,
+        decoder = Decoder(
             dim = dim,
-            depth = enc_depth,
-            dim_head = dim_head,
+            depth = dec_depth,
+            attn_dim_head = dim_head,
             heads = heads,
-            max_seq_len = max_seq_len,
-            local_attn_window_size = window_size,
             **transformer_kwargs
         )
 
@@ -146,8 +141,14 @@ class HNetLM(Module):
         prompt_seq_len, out = prompt.shape[-1], prompt.clone()
         sample_num_times = max(0, seq_len - prompt_seq_len)
 
+        cache = None
+
         for _ in range(sample_num_times):
-            logits = self.forward(out, return_loss = False)
+            if not exists(cache):
+                logits, cache = self.forward(out, return_hiddens = True)
+            else:
+                logits, cache = self.forward(out[:, -1:], return_hiddens = True, cache = cache, start_pos = out.shape[-1] - 1)
+            
             logits = logits[:, -1]
 
             logits = top_k(logits, thres = filter_thres)
@@ -157,7 +158,7 @@ class HNetLM(Module):
 
         return out[..., prompt_seq_len:]
 
-    def forward(self, x, return_loss = False):
+    def forward(self, x, return_loss = False, return_hiddens = False, cache = None, start_pos = 0):
 
         if return_loss:
             x, target = x[:, :-1], x[:, 1:]
@@ -165,15 +166,21 @@ class HNetLM(Module):
         seq_len, device = x.shape[-1], x.device
 
         tokens = self.token_emb(x)
-        pos_emb = self.pos_emb(torch.arange(seq_len, device = device))
+        pos_emb = self.pos_emb(torch.arange(start_pos, start_pos + seq_len, device = device))
 
         tokens = tokens + pos_emb
 
-        embed, aux_loss = self.hnet(tokens)
+        out = self.hnet(tokens, return_hiddens = return_hiddens, cache = cache)
+        
+        embed = out.output
+        aux_loss = out.loss
 
         logits = self.to_logits(embed)
 
         if not return_loss:
+            if return_hiddens:
+                return logits, out.next_cache
+
             return logits
 
         ar_loss =  F.cross_entropy(
@@ -183,88 +190,117 @@ class HNetLM(Module):
 
         return ar_loss + aux_loss, (ar_loss, aux_loss)
 
-model = HNetLM(
-    num_tokens = 256,
-    dim = 256,
-    dim_inner = 512,
-    enc_depth = 3,
-    depth = 2,
-    dec_depth = 3,
-).cuda()
+def main(
+    cpu = False,
+    num_batches = int(1e5),
+    batch_size = 4,
+    grad_accum_every = 4,
+    learning_rate = 1e-4,
+    validate_every = 100,
+    prime_length = 32,
+    generate_every = 500,
+    generate_length = 256,
+    seq_len = 512
+):
+    accelerator = Accelerator(
+        gradient_accumulation_steps=grad_accum_every,
+        cpu=cpu
+    )
+    device = accelerator.device
 
-# prepare enwik8 data
+    model = HNetLM(
+        num_tokens = 256,
+        dim = 256,
+        dim_inner = 512,
+        enc_depth = 3,
+        depth = 2,
+        dec_depth = 3,
+        max_seq_len = max(seq_len, generate_length),
+    )
 
-with gzip.open("./data/enwik8.gz") as file:
-    data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
-    np_train, np_valid = np.split(data, [int(90e6)])
-    data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+    # prepare enwik8 data
 
-class TextSamplerDataset(Dataset):
-    def __init__(self, data, seq_len):
-        super().__init__()
-        self.data = data
-        self.seq_len = seq_len
+    with gzip.open("./data/enwik8.gz") as file:
+        data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
+        np_train, np_valid = np.split(data, [int(90e6)])
+        data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
 
-    def __len__(self):
-        return self.data.size(0) // self.seq_len
+    class TextSamplerDataset(Dataset):
+        def __init__(self, data, seq_len):
+            super().__init__()
+            self.data = data
+            self.seq_len = seq_len
 
-    def __getitem__(self, index):
-        rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
-        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
-        return full_seq.cuda()
+        def __len__(self):
+            return self.data.size(0) // self.seq_len
 
-train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
-train_loader = DataLoader(train_dataset, batch_size = BATCH_SIZE)
-val_loader = DataLoader(val_dataset, batch_size = BATCH_SIZE)
+        def __getitem__(self, index):
+            rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
+            full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
+            return full_seq
 
-# optimizer
+    train_dataset = TextSamplerDataset(data_train, seq_len)
+    val_dataset = TextSamplerDataset(data_val, seq_len)
+    train_loader = DataLoader(train_dataset, batch_size = batch_size)
+    val_loader = DataLoader(val_dataset, batch_size = batch_size)
 
-optim = Adam(model.parameters(), lr = LEARNING_RATE)
+    # optimizer
 
-train_loader = cycle(train_loader)
-val_loader = cycle(val_loader)
+    optim = Adam(model.parameters(), lr = learning_rate)
 
-# training
+    model, optim, train_loader, val_loader = accelerator.prepare(
+        model, optim, train_loader, val_loader
+    )
 
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
-    model.train()
+    train_loader = cycle(train_loader)
+    val_loader = cycle(val_loader)
 
-    for _ in range(GRAD_ACCUM_EVERY):
-        data = next(train_loader)
+    # training
 
-        loss, (ar_loss, aux_loss) = model(data, return_loss = True)
+    for i in tqdm.tqdm(range(num_batches), mininterval = 10.0, desc = "training"):
+        model.train()
 
-        (loss / GRAD_ACCUM_EVERY).backward()
+        for _ in range(grad_accum_every):
+            with accelerator.accumulate(model):
+                data = next(train_loader)
 
-    print(f"training loss: {ar_loss.item():.3f}")
+                loss, (ar_loss, aux_loss) = model(data, return_loss = True)
 
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                accelerator.backward(loss)
 
-    optim.step()
-    optim.zero_grad()
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), 0.5)
 
-    if i % VALIDATE_EVERY == 0:
-        model.eval()
-        with torch.no_grad():
-            valid_data = next(val_loader)
+                optim.step()
+                optim.zero_grad()
 
-            loss, (ar_loss, aux_loss) = model(valid_data, return_loss = True)
-            print(f"validation loss: {ar_loss.item():.3f}")
+        accelerator.print(f"training loss: {ar_loss.item():.3f}")
 
-    if i % GENERATE_EVERY == 0:
-        model.eval()
+        if divisible_by(i, validate_every):
+            model.eval()
+            with torch.no_grad():
+                valid_data = next(val_loader)
 
-        inp = random.choice(val_dataset)[:PRIME_LENGTH]
-        inp = inp.cuda()
+                loss, (ar_loss, aux_loss) = model(valid_data, return_loss = True)
+                accelerator.print(f"validation loss: {ar_loss.item():.3f}")
 
-        prime = decode_tokens(inp)
-        print(f"\n\nINPUT: {prime}")
+        if divisible_by(i, generate_every):
+            model.eval()
 
-        prompt = inp[None, ...]
+            inp = random.choice(val_dataset)[:prime_length]
+            inp = inp.to(device)
 
-        sampled = model.sample(prompt, GENERATE_LENGTH)
+            prime = decode_tokens(inp)
+            accelerator.print(f"\n\nINPUT: {prime}")
 
-        base_decode_output = decode_tokens(sampled[0])
+            prompt = inp[None, ...]
 
-        print(f"\nOUTPUT: {base_decode_output}\n\n")
+            # sample from unwrapped model since it has the .sample method
+            sampled = accelerator.unwrap_model(model).sample(prompt, generate_length)
+
+            base_decode_output = decode_tokens(sampled[0])
+
+            accelerator.print(f"\nOUTPUT: {base_decode_output}\n\n")
+
+if __name__ == '__main__':
+    fire.Fire(main)

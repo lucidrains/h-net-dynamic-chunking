@@ -46,11 +46,11 @@ def test_hnet():
 
     tokens = torch.randn(1, 1024, 512)
 
-    out, aux_loss = net(tokens) # (1, 1024, 512), (1,)
-    assert aux_loss.numel() == 1
+    out = net(tokens) # (1, 1024, 512), (1,)
+    assert out.loss.numel() == 1
 
-    net, aux_loss, intermediates = net(tokens, return_intermediates = True)
-    assert all(isinstance(el, Intermediates) for el in intermediates)
+    out = net(tokens, return_intermediates = True)
+    assert all(isinstance(el, Intermediates) for el in out.intermediates)
 
 def test_multihead_hnet():
     from h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
@@ -146,9 +146,9 @@ def test_access_downsampled_from_h_net_intermediate():
 
     tokens = torch.randn(1, 1024, 512)
 
-    out, aux_loss, intermediates = net(tokens, return_intermediates = True)
+    out = net(tokens, return_intermediates = True)
 
-    downsampled = intermediates.input_downsampled_tokens
+    downsampled = out.intermediates.input_downsampled_tokens
     batch, down_seq, dim = downsampled.shape
     assert batch == 1 and dim == 512 and down_seq <= 1024
 
@@ -174,9 +174,9 @@ def test_vq_and_fetch_indices_from_intermediates(use_vq):
     )
 
     tokens = torch.randn(1, 1024, 512)
-    out, aux_loss, intermediates = net(tokens, return_intermediates = True)
+    out = net(tokens, return_intermediates = True)
 
-    indices = intermediates.quantized_downsampled_indices
+    indices = out.intermediates.quantized_downsampled_indices
     
     if use_vq:
         assert exists(indices)
@@ -209,6 +209,160 @@ def test_inner_network_pos_kwarg():
     )
 
     tokens = torch.randn(2, 128, dim)
-    out, aux_loss = net(tokens)
+    out = net(tokens)
 
-    assert out.shape == tokens.shape
+    assert out.output.shape == tokens.shape
+
+def test_hnet_cache_parity():
+    import torch
+    from x_transformers import Decoder
+    from h_net_dynamic_chunking import HNet
+
+    dim = 64
+    heads = 1
+    seq_len = 16
+
+    encoder = Decoder(dim = dim, depth = 1, heads = heads)
+    inner_network = Decoder(dim = dim, depth = 2, heads = heads)
+    decoder = Decoder(dim = dim, depth = 1, heads = heads)
+
+    hnet = HNet(
+        encoder = encoder,
+        network = inner_network,
+        decoder = decoder,
+        dim = dim,
+        heads = heads,
+    )
+    hnet.eval()
+
+    tokens = torch.randn(1, seq_len, dim)
+
+    with torch.no_grad():
+        parallel_out = hnet(tokens).output
+
+    cache = None
+    sequential_outs = []
+
+    with torch.no_grad():
+        for i in range(seq_len):
+            token = tokens[:, i:i+1]
+            out = hnet(token, cache=cache, return_hiddens = True)
+            cache = out.next_cache
+            sequential_outs.append(out.output)
+
+    sequential_out = torch.cat(sequential_outs, dim = 1)
+    assert torch.allclose(parallel_out, sequential_out, atol = 1e-4)
+
+def test_nested_hnet_cache_parity():
+    import torch
+    from x_transformers import Decoder
+    from h_net_dynamic_chunking import HNet
+
+    dim = 64
+    heads = 1
+    seq_len = 16
+
+    encoder = Decoder(dim = dim, depth = 1, heads = heads)
+    inner_network1 = Decoder(dim = dim, depth = 2, heads = heads)
+    inner_network2 = Decoder(dim = dim, depth = 2, heads = heads)
+    inner_network3 = Decoder(dim = dim, depth = 2, heads = heads)
+    decoder = Decoder(dim = dim, depth = 1, heads = heads)
+
+    hnet_inner = HNet(
+        encoder = inner_network1,
+        network = inner_network2,
+        decoder = inner_network3,
+        dim = dim,
+        heads = heads,
+    )
+
+    hnet = HNet(
+        encoder = encoder,
+        network = hnet_inner,
+        decoder = decoder,
+        dim = dim,
+        heads = heads,
+    )
+    hnet.eval()
+
+    tokens = torch.randn(1, seq_len, dim)
+
+    with torch.no_grad():
+        parallel_out = hnet(tokens).output
+
+    cache = None
+    sequential_outs = []
+
+    with torch.no_grad():
+        for i in range(seq_len):
+            token = tokens[:, i:i+1]
+            out = hnet(token, cache=cache, return_hiddens=True)
+            cache = out.next_cache
+            sequential_outs.append(out.output)
+
+    sequential_out = torch.cat(sequential_outs, dim = 1)
+    assert torch.allclose(parallel_out, sequential_out, atol = 1e-4)
+
+def test_deeply_nested_hnet_cache_parity():
+    import torch
+    from x_transformers import Decoder
+    from h_net_dynamic_chunking import HNet
+
+    dim = 64
+    heads = 1
+    seq_len = 16
+
+    encoder = Decoder(dim = dim, depth = 1, heads = heads)
+    
+    inner_network1 = Decoder(dim = dim, depth = 1, heads = heads)
+    inner_network2 = Decoder(dim = dim, depth = 1, heads = heads)
+    inner_network3 = Decoder(dim = dim, depth = 1, heads = heads)
+    
+    inner_inner_network1 = Decoder(dim = dim, depth = 1, heads = heads)
+    inner_inner_network2 = Decoder(dim = dim, depth = 1, heads = heads)
+    inner_inner_network3 = Decoder(dim = dim, depth = 1, heads = heads)
+
+    decoder = Decoder(dim = dim, depth = 1, heads = heads)
+
+    hnet_inner_inner = HNet(
+        encoder = inner_inner_network1,
+        network = inner_inner_network2,
+        decoder = inner_inner_network3,
+        dim = dim,
+        heads = heads,
+    )
+
+    hnet_inner = HNet(
+        encoder = inner_network1,
+        network = hnet_inner_inner,
+        decoder = inner_network3,
+        dim = dim,
+        heads = heads,
+    )
+
+    hnet = HNet(
+        encoder = encoder,
+        network = hnet_inner,
+        decoder = decoder,
+        dim = dim,
+        heads = heads,
+    )
+    hnet.eval()
+
+    tokens = torch.randn(1, seq_len, dim)
+
+    with torch.no_grad():
+        parallel_out = hnet(tokens).output
+
+    cache = None
+    sequential_outs = []
+
+    with torch.no_grad():
+        for i in range(seq_len):
+            token = tokens[:, i:i+1]
+            out = hnet(token, cache=cache, return_hiddens=True)
+            cache = out.next_cache
+            sequential_outs.append(out.output)
+
+    sequential_out = torch.cat(sequential_outs, dim = 1)
+    assert torch.allclose(parallel_out, sequential_out, atol = 1e-4)

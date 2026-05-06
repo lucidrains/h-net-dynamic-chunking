@@ -1,6 +1,6 @@
 [project]
 name = "h-net-dynamic-chunking"
-version = "0.4.3"
+version = "0.5.0"
 description = "H-Net Dynamic Chunking Modules"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -28,7 +28,8 @@ dependencies = [
     "einops>=0.8.0",
     "vector-quantize-pytorch>=1.28.2",
     "torch>=2.5",
-    "torch-einops-utils>=0.0.32"
+    "torch-einops-utils>=0.0.32",
+    "x-transformers"
 ]
 
 [project.urls]
@@ -37,8 +38,6 @@ Repository = "https://github.com/lucidrains/h-net-dynamic-chunking"
 
 [project.optional-dependencies]
 examples = [
-    "local-attention>=1.11.2",
-    "simplicial-attention>=0.1.5",
     "tqdm"
 ]
 test = [

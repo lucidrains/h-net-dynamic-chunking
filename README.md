@@ -84,7 +84,8 @@ net = HNet(
 
 tokens = torch.randn(1, 1024, 512)
 
-out, aux_loss = net(tokens) # (1, 1024, 512), (1,)
+ret = net(tokens)
+out, aux_loss = ret.output, ret.loss # (1, 1024, 512), ()
 ```
 
 ## Example

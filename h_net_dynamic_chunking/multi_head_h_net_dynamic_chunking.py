@@ -3,7 +3,7 @@
 from collections import namedtuple
 
 import torch
-from torch import cat, arange
+from torch import cat, arange, tensor, repeat_interleave
 from torch.nested import nested_tensor
 from torch.nn import Module, Linear, Parameter, Sequential, RMSNorm, Identity
 from torch.nn.functional import cosine_similarity, pad
@@ -150,7 +150,7 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         # zero
 
-        self.register_buffer('zero', torch.tensor(0.), persistent = False)
+        self.register_buffer('zero', tensor(0.), persistent = False)
 
     def upsample(
         self,
@@ -190,14 +190,7 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         # get the mask and residual from downsample steps
 
-        downsampled_without_padding = downsampled[mask]
-        chunk_lens_without_padding = intermediates.chunk_lens[mask]
-
-        seq = arange(downsampled_without_padding.shape[0], device = device)
-
-        repeated_indices = torch.repeat_interleave(seq, chunk_lens_without_padding, dim = 0)
-        upsampled = downsampled_without_padding[repeated_indices]
-
+        upsampled = repeat_interleave(downsampled[mask], intermediates.chunk_lens[mask], dim = 0)
         upsampled = rearrange(upsampled, '(b n) d -> b n d', b = batch)
 
         scale = intermediates.upsampler_output_scale
@@ -260,7 +253,7 @@ class MultiHeadDynamicSequenceChunker(Module):
         num_chunks = boundary_mask.long().sum(dim = -1)
 
         boundary_mask_with_end = pad(boundary_mask, (0, 1), value = True)
-        sel_indices = repeat(arange(boundary_mask_with_end.shape[-1], device = device), 'n -> b n', b = batch * heads)[boundary_mask_with_end]
+        sel_indices = boundary_mask_with_end.nonzero()[:, 1]
 
         sel_indices = nested_tensor(sel_indices.split((num_chunks + 1).tolist()), layout = torch.jagged, device = device)
 
@@ -355,7 +348,4 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         outputs = Outputs(downsampled_tokens, upsample, weighted_aux_loss)
 
-        if not return_intermediates:
-            return outputs
-
-        return outputs, intermediates
+        return (outputs, intermediates) if return_intermediates else outputs
