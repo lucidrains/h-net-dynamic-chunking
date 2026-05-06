@@ -1,0 +1,806 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "accelerate",
+#     "assoc-scan",
+#     "discrete-continuous-embed-readout",
+#     "einops",
+#     "fire",
+#     "gymnasium[box2d]>=1.0.0",
+#     "gymnasium[other]",
+#     "hl-gauss-pytorch",
+#     "memmap-replay-buffer",
+#     "numpy",
+#     "torch",
+#     "tqdm",
+#     "vector-quantize-pytorch",
+#     "wandb",
+#     "x-evolution>=0.0.20",
+#     "x-mlps-pytorch",
+#     "x-transformers"
+# ]
+# ///
+
+from __future__ import annotations
+
+import os
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+import shutil
+from pathlib import Path
+from collections import deque
+
+import numpy as np
+from tqdm import tqdm
+import fire
+import wandb
+
+from accelerate import Accelerator
+
+import torch
+from torch import tensor
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
+
+from einops import rearrange
+
+import gymnasium as gym
+
+from x_mlps_pytorch import MLP
+from hl_gauss_pytorch import HLGaussLoss
+from discrete_continuous_embed_readout import Readout
+from memmap_replay_buffer import ReplayBuffer
+from assoc_scan import AssocScan
+from x_transformers import Decoder
+from h_net_dynamic_chunking.h_net import HNet
+
+# helpers
+
+def exists(v):
+    return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
+
+def cast_tuple(t):
+    return t if isinstance(t, (tuple, list)) else (t,)
+
+# actor critic - simple mlp based ppo agent
+
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim = 8, action_dim = 4):
+        super().__init__()
+
+        # actor
+
+        self.actor_mlp = MLP(state_dim, 64, 64, 64)
+        self.actor_readout = Readout(dim = 64, num_discrete = action_dim)
+
+        # critic
+
+        self.hl_gauss_loss = HLGaussLoss(
+            min_value = -400.,
+            max_value = 400.,
+            num_bins = 256
+        )
+
+        self.critic_mlp = MLP(state_dim, 64, 64, 256)
+
+    def get_action_and_value(self, state, action = None):
+        actor_features = self.actor_mlp(state)
+        logits = self.actor_readout(actor_features)
+        logits = cast_tuple(logits)[0]
+
+        probs = torch.distributions.Categorical(logits = logits)
+
+        if not exists(action):
+            action = probs.sample()
+
+        critic_logits = self.critic_mlp(state)
+        value = self.hl_gauss_loss(critic_logits)
+
+        return action, probs.log_prob(action), probs.entropy(), value, critic_logits
+
+# discovery module - hierarchical transformer with h-net dynamic chunking
+
+class DiscoveryModule(nn.Module):
+    def __init__(
+        self,
+        state_dim = 8,
+        action_dim = 4,
+        dim = 64,
+        decoder1_depth = 1,
+        hnet_depth = 1,
+        decoder2_depth = 1,
+        heads = 4,
+        dim_head = 32,
+        use_pope = True,
+        decoder_kwargs: dict | None = None,
+        hnet_kwargs: dict | None = None,
+        loss_weights: dict | None = None
+    ):
+        super().__init__()
+
+        self.use_pope = use_pope
+
+        default_pos_kwargs = dict(
+            polar_pos_emb = use_pope,
+            rotary_pos_emb = not use_pope
+        )
+
+        decoder_kwargs = default(decoder_kwargs, default_pos_kwargs)
+        for k, v in default_pos_kwargs.items():
+            decoder_kwargs.setdefault(k, v)
+
+        hnet_kwargs = default(hnet_kwargs, dict(heads = 1, target_avg_token_length = 4.))
+        loss_weights = default(loss_weights, dict(
+            state_to_action = 1.,
+            action_to_state = 1.,
+            action_to_action = 1.,
+            hnet_aux = 0.1
+        ))
+
+        self.dim = dim
+        self.loss_weights = loss_weights
+
+        # embeddings
+
+        self.state_proj = nn.Linear(state_dim, dim)
+        self.action_emb = nn.Embedding(action_dim, dim)
+
+        # decoder sandwich: decoder1 → hnet → decoder2
+
+        self.decoder1 = Decoder(dim = dim, depth = decoder1_depth, heads = heads, attn_dim_head = dim_head, **decoder_kwargs)
+
+        self.hnet = HNet(
+            encoder = nn.Identity(),
+            network = Decoder(dim = dim, depth = hnet_depth, heads = heads, attn_dim_head = dim_head, **decoder_kwargs),
+            decoder = nn.Identity(),
+            dim = dim,
+            **hnet_kwargs
+        )
+
+        self.decoder2 = Decoder(dim = dim, depth = decoder2_depth, heads = heads, attn_dim_head = dim_head, **decoder_kwargs)
+
+        # readouts
+
+        self.state_readout = Readout(dim = dim, num_discrete = action_dim)
+        self.action_readout = Readout(dim = dim, num_discrete = action_dim)
+        self.to_next_state = nn.Linear(dim, state_dim)
+
+    def forward(self, states, actions, mask = None, return_loss_breakdown = False, extract_high_level_actions = False):
+        b, n = states.shape[:2]
+        device = states.device
+
+        # interleave [s0, a0, s1, a1, ...]
+
+        state_repr = self.state_proj(states)
+        action_repr = self.action_emb(actions)
+
+        interleaved = torch.empty((b, 2 * n, self.dim), device = device, dtype = states.dtype)
+        interleaved[:, 0::2] = state_repr
+        interleaved[:, 1::2] = action_repr
+
+        # decoder1 over full interleaved stream
+
+        dec1_out = self.decoder1(interleaved)
+
+        # hnet processes only state positions
+
+        state_out = dec1_out[:, 0::2]
+        action_out = dec1_out[:, 1::2]
+
+        hnet_ret = self.hnet(state_out, return_intermediates = extract_high_level_actions)
+        hnet_state_out = hnet_ret.output
+        hnet_aux_loss = hnet_ret.loss
+
+        if extract_high_level_actions:
+            intermediates = hnet_ret.intermediates
+            if isinstance(intermediates, tuple) and not hasattr(intermediates, 'input_downsampled_tokens'):
+                intermediates = intermediates[0]
+            return intermediates.input_downsampled_tokens, intermediates.chunk_lens
+
+        # re-interleave: hnet-processed states + raw actions
+
+        reinterleaved = torch.empty_like(interleaved)
+        reinterleaved[:, 0::2] = hnet_state_out
+        reinterleaved[:, 1::2] = action_out
+
+        # decoder2 over re-interleaved stream
+
+        dec2_out = self.decoder2(reinterleaved)
+
+        state_features = dec2_out[:, 0::2]
+        action_features = dec2_out[:, 1::2]
+
+        # losses - masked for variable-length episodes
+
+        pred_actions = rearrange(self.state_readout(state_features), 'b n d -> (b n) d')
+        target_actions = rearrange(actions, 'b n -> (b n)').long()
+
+        if exists(mask):
+            flat_mask = rearrange(mask, 'b n -> (b n)')
+            pred_actions = pred_actions[flat_mask]
+            target_actions = target_actions[flat_mask]
+
+        loss_state_to_action = F.cross_entropy(pred_actions, target_actions)
+
+        loss_action_to_state = tensor(0., device = device)
+        loss_action_to_action = tensor(0., device = device)
+
+        if n > 1:
+            pred_next_states = rearrange(self.to_next_state(action_features[:, :-1]), 'b n d -> (b n) d')
+            pred_next_actions = rearrange(self.action_readout(action_features[:, :-1]), 'b n d -> (b n) d')
+
+            next_states = rearrange(states[:, 1:], 'b n d -> (b n) d')
+            next_actions = rearrange(actions[:, 1:], 'b n -> (b n)').long()
+
+            if exists(mask):
+                shifted_mask = rearrange(mask[:, :-1] & mask[:, 1:], 'b n -> (b n)')
+
+                pred_next_states = pred_next_states[shifted_mask]
+                pred_next_actions = pred_next_actions[shifted_mask]
+                next_states = next_states[shifted_mask]
+                next_actions = next_actions[shifted_mask]
+
+            if pred_next_states.numel() > 0:
+                loss_action_to_state = F.mse_loss(pred_next_states, next_states)
+                loss_action_to_action = F.cross_entropy(pred_next_actions, next_actions)
+
+        w = self.loss_weights
+        total_loss = (
+            w.get('state_to_action', 1.) * loss_state_to_action +
+            w.get('action_to_state', 1.) * loss_action_to_state +
+            w.get('action_to_action', 1.) * loss_action_to_action +
+            w.get('hnet_aux', 1.) * hnet_aux_loss
+        )
+
+        if not return_loss_breakdown:
+            return total_loss
+
+        return total_loss, dict(
+            state_to_action = loss_state_to_action.item(),
+            action_to_state = loss_action_to_state.item(),
+            action_to_action = loss_action_to_action.item(),
+            hnet_aux = hnet_aux_loss.item()
+        )
+
+    @torch.no_grad()
+    def get_action_and_value(self, state, action = None, cache = None, extract_high_level_actions = False):
+        cache_dec1, cache_hnet, cache_dec2 = default(cache, (None, None, None))
+        is_caching = exists(cache)
+
+        # process state through decoder1 → hnet → decoder2
+
+        state_repr = self.state_proj(state)
+
+        dec1_out, cache_dec1 = self.decoder1(
+            rearrange(state_repr, 'b d -> b 1 d'),
+            cache = cache_dec1,
+            return_hiddens = True,
+            input_not_include_cache = is_caching
+        )
+
+        hnet_ret = self.hnet(
+            dec1_out,
+            cache = cache_hnet,
+            return_hiddens = True,
+            return_intermediates = extract_high_level_actions
+        )
+
+        if extract_high_level_actions:
+            intermediates = hnet_ret.intermediates
+            if isinstance(intermediates, tuple) and not hasattr(intermediates, 'input_downsampled_tokens'):
+                intermediates = intermediates[0]
+            return intermediates.input_downsampled_tokens, intermediates.chunk_lens, (cache_dec1, hnet_ret.next_cache, cache_dec2)
+
+        cache_hnet = hnet_ret.next_cache
+
+        dec2_out, cache_dec2 = self.decoder2(
+            hnet_ret.output,
+            cache = cache_dec2,
+            return_hiddens = True,
+            input_not_include_cache = is_caching
+        )
+
+        # readout action from state position
+
+        action_logits = self.state_readout(rearrange(dec2_out, 'b 1 d -> b d'))
+        probs = torch.distributions.Categorical(logits = action_logits)
+
+        if not exists(action):
+            action = probs.sample()
+
+        # process action through decoder1 → decoder2 (skip hnet for action positions)
+
+        action_repr = self.action_emb(action)
+
+        a_dec1_out, cache_dec1 = self.decoder1(
+            rearrange(action_repr, 'b d -> b 1 d'),
+            cache = cache_dec1,
+            return_hiddens = True,
+            input_not_include_cache = True
+        )
+
+        _, cache_dec2 = self.decoder2(
+            a_dec1_out,
+            cache = cache_dec2,
+            return_hiddens = True,
+            input_not_include_cache = True
+        )
+
+        next_cache = (cache_dec1, cache_hnet, cache_dec2)
+
+        return action, probs.entropy(), action_logits, next_cache
+
+# gae using associative scan
+
+def calc_gae(
+    rewards,
+    values,
+    masks,
+    gamma = 0.99,
+    lam = 0.95,
+    use_accelerated = None
+):
+    assert values.shape[-1] == rewards.shape[-1]
+    use_accelerated = default(use_accelerated, rewards.is_cuda)
+
+    values_padded = F.pad(values, (0, 1), value = 0.)
+    values, values_next = values_padded[:-1], values_padded[1:]
+
+    delta = rewards + gamma * values_next * masks - values
+    gates = gamma * lam * masks
+
+    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
+    gae = scan(gates, delta)
+
+    return gae + values
+
+# evaluation
+
+def evaluate_agent(
+    env_name = 'LunarLander-v3',
+    model = None,
+    num_episodes = 20,
+    video_folder = 'eval_videos',
+    record_every = 5,
+    device = 'cpu',
+    seed = 42,
+    store_buffer = False,
+    buffer_folder = './discovery_buffer',
+    render_videos = True,
+    forward_has_cache = False
+):
+    shutil.rmtree(video_folder, ignore_errors = True)
+
+    original_device = next(model.parameters()).device
+    model = model.to('cpu')
+    device = 'cpu'
+
+    env = gym.make(env_name, render_mode = 'rgb_array' if render_videos else None)
+
+    if render_videos:
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder = video_folder,
+            episode_trigger = lambda x: x % record_every == 0 if record_every > 0 else False,
+            disable_logger = True
+        )
+
+    buffer = None
+
+    if store_buffer:
+        shutil.rmtree(buffer_folder, ignore_errors = True)
+        Path(buffer_folder).mkdir(parents = True, exist_ok = True)
+
+        buffer = ReplayBuffer(
+            folder = buffer_folder,
+            max_episodes = num_episodes,
+            max_timesteps = 1000,
+            fields = dict(
+                state = ('float', (8,)),
+                action = ('int', ())
+            )
+        )
+
+    model.eval()
+    ep_rewards = []
+    pbar = tqdm(range(num_episodes), desc = 'Evaluating Agent')
+
+    for ep in pbar:
+        state, _ = env.reset(seed = seed + ep)
+
+        done = False
+        step_count = 0
+        ep_reward_sum = 0.
+
+        ep_states = []
+        ep_actions = []
+
+        cache = None
+
+        with torch.no_grad():
+            while not done and step_count < 1000:
+                ep_states.append(state)
+                state_tensor = rearrange(tensor(state, dtype = torch.float32, device = device), 'd -> 1 d')
+
+                if forward_has_cache:
+                    action, *_, cache = model.get_action_and_value(state_tensor, cache = cache)
+                else:
+                    action, *_ = model.get_action_and_value(state_tensor)
+
+                a = action.item()
+                ep_actions.append(a)
+
+                next_state, reward, terminated, truncated, _ = env.step(a)
+                done = terminated or truncated
+                state = next_state
+                ep_reward_sum += reward
+                step_count += 1
+
+        ep_rewards.append(ep_reward_sum)
+        avg_reward = np.mean(ep_rewards)
+        pbar.set_postfix({'Avg Reward': f'{avg_reward:.2f}', 'Ep Reward': f'{ep_reward_sum:.2f}'})
+
+        if store_buffer:
+            with buffer.one_episode():
+                for t in range(step_count):
+                    buffer.store(state = ep_states[t], action = ep_actions[t])
+
+    avg_reward = np.mean(ep_rewards)
+    print(f'\nEvaluation Complete! Average Reward over {num_episodes} episodes: {avg_reward:.2f}')
+    print(f'Videos saved to: {Path(video_folder).absolute()}')
+
+    env.close()
+    model = model.to(original_device)
+
+    if store_buffer:
+        return avg_reward, buffer
+
+    return avg_reward
+
+# main training entrypoint
+
+def train_metacontroller(
+    total_episodes = 750,
+    lr = 3e-4,
+    gamma = 0.99,
+    gae_lambda = 0.95,
+    clip_coef = 0.2,
+    entropy_coef = 0.01,
+    value_coef = 0.5,
+    epochs = 4,
+    batch_size = 64,
+    rolling_window = 20,
+    seed = 42,
+    cpu = False,
+    record_video_every = 50,
+    use_wandb = False,
+    target_avg_cum_reward = -50.0,
+    margin_of_error = 25.0,
+    evaluate = False,
+    train_discovery = False,
+    skip_ppo_eval = False,
+    load_path = './metacontroller_agent.pt',
+    eval_episodes = 20
+):
+    if use_wandb:
+        run_name = 'behavior_clone_phase' if train_discovery else 'initial_policy_optimization'
+        wandb.init(project = 'h-net-dynamic-chunking', name = run_name, config = dict(
+            lr = lr, gamma = gamma, gae_lambda = gae_lambda,
+            clip_coef = clip_coef, entropy_coef = entropy_coef, value_coef = value_coef,
+            epochs = epochs, batch_size = batch_size
+        ))
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    shutil.rmtree('videos', ignore_errors = True)
+
+    env = gym.make('LunarLander-v3', render_mode = 'rgb_array')
+    env = gym.wrappers.RecordVideo(
+        env,
+        video_folder = 'videos',
+        episode_trigger = lambda x: x % record_video_every == 0 if record_video_every > 0 else False,
+        disable_logger = True
+    )
+
+    accelerator = Accelerator(cpu = cpu, mixed_precision = 'no')
+    device = accelerator.device
+    print(f'Using device: {device}')
+
+    model = ActorCritic(state_dim = 8, action_dim = 4).to(device)
+    optimizer = Adam(model.parameters(), lr = lr)
+    model, optimizer = accelerator.prepare(model, optimizer)
+
+    # evaluation mode
+
+    if evaluate:
+        print(f'Loading agent weights from {load_path}...')
+        model.load_state_dict(torch.load(load_path, map_location = device))
+
+        evaluate_agent(
+            model = model,
+            num_episodes = eval_episodes,
+            video_folder = 'eval_videos',
+            record_every = max(1, eval_episodes // 4),
+            device = device,
+            seed = seed
+        )
+        return
+
+    # discovery distillation mode
+
+    if train_discovery:
+        print(f'Loading agent weights from {load_path}...')
+        model.load_state_dict(torch.load(load_path, map_location = device))
+
+        if not skip_ppo_eval:
+            avg_reward = evaluate_agent(
+                model = model,
+                num_episodes = 20,
+                video_folder = 'initial_verification_videos',
+                record_every = 0,
+                device = device,
+                seed = seed,
+                store_buffer = False
+            )
+
+            print(f'Initial Verification Reward: {avg_reward:.2f}')
+            expected_reward = target_avg_cum_reward - margin_of_error
+            assert avg_reward >= expected_reward, f'Expected initial PPO reward >= {expected_reward:.2f}, got {avg_reward:.2f}. Please train PPO longer.'
+        else:
+            print('Skipping PPO initial evaluation as requested.')
+
+        discovery_mod = DiscoveryModule().to(device)
+
+        if Path('discovery.pt').exists():
+            print('Loading existing discovery.pt...')
+            discovery_mod.load_state_dict(torch.load('discovery.pt', map_location = device))
+
+        disc_optimizer = Adam(discovery_mod.parameters(), lr = 1e-4)
+        discovery_mod, disc_optimizer = accelerator.prepare(discovery_mod, disc_optimizer)
+
+        best_eval_reward = -float('inf')
+        loop_count = 0
+
+        while best_eval_reward < -75.0:
+            loop_count += 1
+            print(f'\n--- Discovery Training Loop {loop_count} ---')
+
+            # gather expert trajectories
+
+            _, buffer = evaluate_agent(
+                model = model,
+                num_episodes = eval_episodes,
+                video_folder = 'discovery_gather_videos',
+                record_every = 0,
+                device = device,
+                seed = seed + loop_count * 1000,
+                store_buffer = True,
+                buffer_folder = './discovery_buffer',
+                render_videos = False
+            )
+
+            dataloader = buffer.dataloader(batch_size = batch_size, fields = ('state', 'action'))
+            dataloader = accelerator.prepare(dataloader)
+
+            # train discovery module
+
+            pbar_disc = tqdm(range(epochs), desc = 'Training DiscoveryModule')
+
+            for ep in pbar_disc:
+                total_loss_sum = 0.
+                num_batches = 0
+
+                for batch in dataloader:
+                    states, actions, lens = [batch[k].to(device) for k in ('state', 'action', '_lens')]
+
+                    # build mask from episode lengths
+
+                    mask = rearrange(torch.arange(states.shape[1], device = device), 'n -> 1 n') < rearrange(lens, 'b -> b 1')
+
+                    loss, breakdown = discovery_mod(states, actions, mask = mask, return_loss_breakdown = True)
+
+                    assert not torch.isnan(loss), 'NaN loss detected during discovery training!'
+
+                    disc_optimizer.zero_grad()
+                    accelerator.backward(loss)
+                    nn.utils.clip_grad_norm_(discovery_mod.parameters(), 0.5)
+                    disc_optimizer.step()
+
+                    total_loss_sum += loss.item()
+                    num_batches += 1
+
+                    if use_wandb:
+                        wandb.log(dict(discovery_loss = loss.item(), **breakdown))
+
+                avg_loss = total_loss_sum / max(num_batches, 1)
+                pbar_disc.set_postfix({'Loss': f'{avg_loss:.4f}'})
+
+            unwrapped_mod = accelerator.unwrap_model(discovery_mod)
+
+            torch.save(unwrapped_mod.state_dict(), 'discovery.pt')
+            print('Saved discovery.pt!')
+
+            # evaluate discovery policy
+
+            print('Evaluating trained DiscoveryPolicy...')
+
+            eval_reward = evaluate_agent(
+                model = unwrapped_mod,
+                num_episodes = 20,
+                video_folder = 'discovery_eval_videos',
+                record_every = 5,
+                device = device,
+                seed = seed + loop_count * 1000,
+                store_buffer = False,
+                forward_has_cache = True
+            )
+
+            if use_wandb:
+                wandb.log(dict(
+                    discovery_eval_reward = eval_reward,
+                    discovery_loop = loop_count
+                ))
+
+                video_files = list(Path('discovery_eval_videos').glob('*.mp4'))
+
+                if len(video_files) > 0:
+                    latest_video = max(video_files, key = os.path.getmtime)
+                    wandb.log({'discovery_eval_video': wandb.Video(str(latest_video))})
+
+            if eval_reward > best_eval_reward:
+                best_eval_reward = eval_reward
+                print(f'New best eval reward: {best_eval_reward:.2f}')
+
+            if best_eval_reward >= -75.0:
+                print(f'DiscoveryModule reached target reward >= -75.0! (best: {best_eval_reward:.2f})')
+                break
+            else:
+                print('Behavior cloning target not yet met. Re-gathering data and continuing training...')
+
+        return
+
+    # ppo training mode
+
+    recent_rewards = deque(maxlen = rolling_window)
+    pbar = tqdm(range(total_episodes), desc = 'Training PPO')
+
+    buffer_dir = Path('./ppo_buffer')
+    buffer_dir.mkdir(exist_ok = True)
+
+    buffer = ReplayBuffer(
+        folder = buffer_dir,
+        max_episodes = 25,
+        max_timesteps = 1000,
+        circular = True,
+        fields = dict(
+            state = ('float', (8,)),
+            action = ('int', ()),
+            log_prob = ('float', ()),
+            advantage = ('float', ()),
+            return_ = ('float', ())
+        )
+    )
+
+    for ep in pbar:
+        state, _ = env.reset(seed = seed + ep)
+
+        ep_states = []
+        ep_actions = []
+        ep_log_probs = []
+        ep_rewards = []
+        ep_values = []
+        ep_dones = []
+
+        ep_reward_sum = 0.
+        done = False
+        step_count = 0
+
+        model.eval()
+
+        with torch.no_grad():
+            while not done and step_count < 1000:
+                state_tensor = rearrange(tensor(state, dtype = torch.float32, device = device), 'd -> 1 d')
+                action, log_prob, _, value, _ = model.get_action_and_value(state_tensor)
+
+                action_item = action.item()
+                next_state, reward, terminated, truncated, _ = env.step(action_item)
+                done = terminated or truncated
+
+                ep_states.append(state)
+                ep_actions.append(action_item)
+                ep_log_probs.append(log_prob.item())
+                ep_rewards.append(reward)
+                ep_values.append(value.item())
+                ep_dones.append(done)
+
+                state = next_state
+                ep_reward_sum += reward
+                step_count += 1
+
+        recent_rewards.append(ep_reward_sum)
+        avg_reward = np.mean(recent_rewards)
+        pbar.set_postfix({'Avg Reward': f'{avg_reward:.2f}', 'Ep Reward': f'{ep_reward_sum:.2f}'})
+
+        if use_wandb:
+            log_dict = dict(
+                episode = ep,
+                reward = ep_reward_sum,
+                avg_reward_last_20 = avg_reward,
+                step_count = step_count
+            )
+
+            if record_video_every > 0 and ep % record_video_every == 0:
+                video_path = f'videos/rl-video-episode-{ep}.mp4'
+                if os.path.exists(video_path):
+                    log_dict['video'] = wandb.Video(video_path)
+
+            wandb.log(log_dict)
+
+        if avg_reward >= target_avg_cum_reward and len(recent_rewards) == rolling_window:
+            save_path = Path('./metacontroller_agent.pt')
+            torch.save(model.state_dict(), save_path)
+            print(f'Target average cumulative reward ({target_avg_cum_reward}) reached! Model saved to {save_path.absolute()}')
+            break
+
+        # compute gae and store episode
+
+        rewards_t = tensor(ep_rewards, dtype = torch.float32, device = device)
+        values_t = tensor(ep_values, dtype = torch.float32, device = device)
+        masks_t = 1.0 - tensor(ep_dones, dtype = torch.float32, device = device)
+
+        returns_t = calc_gae(rewards_t, values_t, masks_t, gamma, gae_lambda)
+        advantages_t = returns_t - values_t
+
+        with buffer.one_episode():
+            for t in range(step_count):
+                buffer.store(
+                    state = ep_states[t],
+                    action = ep_actions[t],
+                    log_prob = ep_log_probs[t],
+                    advantage = advantages_t[t].item(),
+                    return_ = returns_t[t].item()
+                )
+
+        # ppo update
+
+        model.train()
+
+        dataloader = buffer.dataloader(
+            batch_size = batch_size,
+            fields = ('state', 'action', 'log_prob', 'advantage', 'return_')
+        )
+
+        for _ in range(epochs):
+            for batch in dataloader:
+                states, actions, old_log_probs, batch_advantages, batch_returns = [
+                    batch[k].to(device) for k in ('state', 'action', 'log_prob', 'advantage', 'return_')
+                ]
+
+                if batch_advantages.numel() > 1:
+                    batch_advantages = (batch_advantages - batch_advantages.mean()) / (batch_advantages.std() + 1e-8)
+
+                _, new_log_probs, entropy, _, critic_logits = model.get_action_and_value(states, actions)
+
+                ratio = (new_log_probs - old_log_probs).exp()
+
+                policy_loss1 = -batch_advantages * ratio
+                policy_loss2 = -batch_advantages * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+                policy_loss = torch.max(policy_loss1, policy_loss2).mean()
+
+                value_loss = model.hl_gauss_loss(critic_logits, batch_returns)
+                entropy_loss = entropy.mean()
+
+                loss = policy_loss - entropy_coef * entropy_loss + value_coef * value_loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                optimizer.step()
+
+if __name__ == '__main__':
+    fire.Fire(train_metacontroller)

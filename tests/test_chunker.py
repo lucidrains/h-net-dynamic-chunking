@@ -177,7 +177,7 @@ def test_vq_and_fetch_indices_from_intermediates(use_vq):
     out = net(tokens, return_intermediates = True)
 
     indices = out.intermediates.quantized_downsampled_indices
-    
+
     if use_vq:
         assert exists(indices)
         assert indices.ndim == 2
@@ -313,11 +313,11 @@ def test_deeply_nested_hnet_cache_parity():
     seq_len = 16
 
     encoder = Decoder(dim = dim, depth = 1, heads = heads)
-    
+
     inner_network1 = Decoder(dim = dim, depth = 1, heads = heads)
     inner_network2 = Decoder(dim = dim, depth = 1, heads = heads)
     inner_network3 = Decoder(dim = dim, depth = 1, heads = heads)
-    
+
     inner_inner_network1 = Decoder(dim = dim, depth = 1, heads = heads)
     inner_inner_network2 = Decoder(dim = dim, depth = 1, heads = heads)
     inner_inner_network3 = Decoder(dim = dim, depth = 1, heads = heads)

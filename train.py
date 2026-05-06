@@ -148,7 +148,7 @@ class HNetLM(Module):
                 logits, cache = self.forward(out, return_hiddens = True)
             else:
                 logits, cache = self.forward(out[:, -1:], return_hiddens = True, cache = cache, start_pos = out.shape[-1] - 1)
-            
+
             logits = logits[:, -1]
 
             logits = top_k(logits, thres = filter_thres)
@@ -171,7 +171,7 @@ class HNetLM(Module):
         tokens = tokens + pos_emb
 
         out = self.hnet(tokens, return_hiddens = return_hiddens, cache = cache)
-        
+
         embed = out.output
         aux_loss = out.loss
 
