@@ -176,7 +176,9 @@ class DiscoveryModule(nn.Module):
                 codebook_size = vq_codebook_size,
                 decay = vq_decay,
                 commitment_weight = vq_commitment_weight,
-                rotation_trick = True
+                rotation_trick = True,
+                kmeans_init = True,
+                kmeans_iters = 10
             )
 
         self.vq = vq
@@ -224,7 +226,7 @@ class DiscoveryModule(nn.Module):
         state_out = dec1_out[:, 0::2]
         action_out = dec1_out[:, 1::2]
 
-        hnet_ret = self.hnet(self.hnet_prenorm(state_out), return_intermediates = extract_high_level_actions)
+        hnet_ret = self.hnet(self.hnet_prenorm(state_out), vq_mask = mask, return_intermediates = extract_high_level_actions)
         hnet_state_out = hnet_ret.output
         hnet_aux_loss = hnet_ret.loss
 
@@ -918,7 +920,7 @@ def train_metacontroller(
     eval_episodes = 20,
     filter_top_percentile = 0.5,
     discrete_high_actions = False,
-    vq_codebook_size = 64,
+    vq_codebook_size = 256,
     vq_decay = 0.8,
     vq_commitment_weight = 1.
 ):

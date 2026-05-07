@@ -142,7 +142,8 @@ class HNet(Module):
         tokens,
         return_intermediates = False,
         return_hiddens = False,
-        cache = None
+        cache = None,
+        vq_mask = None
     ):
         is_caching = exists(cache) or return_hiddens
 
@@ -171,7 +172,7 @@ class HNet(Module):
         maybe_commit_loss = self.zero
 
         if exists(self.vq):
-            encoded, indices, maybe_commit_loss = self.vq(encoded)
+            encoded, indices, maybe_commit_loss = self.vq(encoded, mask = vq_mask)
 
         # downsample via dynamic chunker
 
