@@ -21,7 +21,7 @@
 # ]
 # ///
 
-# inspiration from Kobayashi et al. https://arxiv.org/abs/2512.20605
+# inspiration from Kobayashi et al. https://arxiv.org/abs/2512.20605 and Hanjung Kim et al https://arxiv.org/abs/2603.05815
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ from hl_gauss_pytorch import HLGaussLoss
 from discrete_continuous_embed_readout import Readout
 from memmap_replay_buffer import ReplayBuffer
 from assoc_scan import AssocScan
-from x_transformers import Decoder
+from x_transformers import Decoder, ContinuousTransformerWrapper
 from h_net_dynamic_chunking.h_net import HNet
 
 # helpers
@@ -342,6 +342,187 @@ class DiscoveryModule(nn.Module):
 
         return action, probs.entropy(), action_logits, next_cache
 
+# conditioned actor critic - ppo agent conditioned on high level actions
+
+class ConditionedActorCritic(nn.Module):
+    def __init__(
+        self,
+        state_dim = 8,
+        action_dim = 4,
+        condition_dim = 128,
+        actor_hidden_dims = (64, 64),
+        critic_hidden_dims = (64, 256),
+        hl_gauss_min_value = -400.,
+        hl_gauss_max_value = 400.,
+        hl_gauss_num_bins = 256
+    ):
+        super().__init__()
+
+        # actor - mirrors original ActorCritic MLP(state_dim, 64, 64, 64)
+        # condition is projected and summed at the input
+
+        first_actor_dim = actor_hidden_dims[0]
+        self.actor_state_proj = nn.Linear(state_dim, first_actor_dim)
+        self.actor_cond_proj = nn.Linear(condition_dim, first_actor_dim)
+
+        self.actor_mlp = MLP(first_actor_dim, *actor_hidden_dims)
+        self.actor_readout = Readout(dim = actor_hidden_dims[-1], num_discrete = action_dim)
+
+        # critic - mirrors original ActorCritic MLP(state_dim, 64, 64, 256)
+
+        self.hl_gauss_loss = HLGaussLoss(
+            min_value = hl_gauss_min_value,
+            max_value = hl_gauss_max_value,
+            num_bins = hl_gauss_num_bins
+        )
+
+        first_critic_dim = critic_hidden_dims[0]
+        self.critic_state_proj = nn.Linear(state_dim, first_critic_dim)
+        self.critic_cond_proj = nn.Linear(condition_dim, first_critic_dim)
+
+        self.critic_mlp = MLP(first_critic_dim, *critic_hidden_dims)
+
+    def forward(self, state, condition):
+        features = F.silu(self.actor_state_proj(state) + self.actor_cond_proj(condition))
+        features = self.actor_mlp(features)
+        return self.actor_readout(features)
+
+    def get_action_and_value(self, state, condition, action = None):
+        logits = self.forward(state, condition)
+        logits = cast_tuple(logits)[0]
+
+        probs = torch.distributions.Categorical(logits = logits)
+
+        if not exists(action):
+            action = probs.sample()
+
+        critic_features = F.silu(self.critic_state_proj(state) + self.critic_cond_proj(condition))
+        critic_logits = self.critic_mlp(critic_features)
+        value = self.hl_gauss_loss(critic_logits)
+
+        return action, probs.log_prob(action), probs.entropy(), value, critic_logits
+
+# unified metacontroller
+
+class Metacontroller(nn.Module):
+    def __init__(
+        self,
+        discovery_mod,
+        state_dim = 8,
+        action_dim = 4,
+        dim = 128,
+        max_seq_len = 1000,
+        decoder_depth = 2,
+        decoder_heads = 4,
+        decoder_dim_head = 32,
+        log_var_min = -5.0,
+        log_var_max = 2.0,
+        lower_controller_kwargs: dict | None = None
+    ):
+        super().__init__()
+        self.discovery_mod = discovery_mod
+        self.discovery_mod.requires_grad_(False)
+        self.discovery_mod.eval()
+
+        self.log_var_min = log_var_min
+        self.log_var_max = log_var_max
+
+        self.metacontroller = ContinuousTransformerWrapper(
+            dim_in = state_dim,
+            dim_out = dim * 2,
+            max_seq_len = max_seq_len,
+            attn_layers = Decoder(
+                dim = dim,
+                depth = decoder_depth,
+                heads = decoder_heads,
+                attn_dim_head = decoder_dim_head
+            )
+        )
+
+        lower_controller_kwargs = default(lower_controller_kwargs, dict())
+        self.lower_controller = ConditionedActorCritic(
+            state_dim = state_dim,
+            action_dim = action_dim,
+            condition_dim = dim,
+            **lower_controller_kwargs
+        )
+
+    def forward(self, states, actions, mask = None, return_loss_breakdown = False):
+        with torch.no_grad():
+            self.discovery_mod.eval()
+            target_hl_actions, chunk_lens = self.discovery_mod(states, actions, extract_high_level_actions = True)
+
+            flat_target_hl_actions = rearrange(target_hl_actions, 'b c d -> (b c) d')
+            flat_chunk_lens = rearrange(chunk_lens, 'b c -> (b c)')
+
+            expanded_flat_targets = torch.repeat_interleave(flat_target_hl_actions, flat_chunk_lens, dim = 0)
+            target_hl_actions = rearrange(expanded_flat_targets, '(b n) d -> b n d', b = states.shape[0])
+
+        pred_hl_actions = self.metacontroller(states)
+
+        if exists(mask):
+            flat_mask = rearrange(mask, 'b n -> (b n)')
+            pred_hl_actions_flat = rearrange(pred_hl_actions, 'b n d -> (b n) d')[flat_mask]
+            target_hl_actions_flat = rearrange(target_hl_actions, 'b n d -> (b n) d')[flat_mask]
+        else:
+            pred_hl_actions_flat = rearrange(pred_hl_actions, 'b n d -> (b n) d')
+            target_hl_actions_flat = rearrange(target_hl_actions, 'b n d -> (b n) d')
+
+        mu, log_var = pred_hl_actions_flat.chunk(2, dim = -1)
+        log_var = log_var.clamp(min = self.log_var_min, max = self.log_var_max)
+        sigma = torch.exp(0.5 * log_var)
+
+        dist = torch.distributions.Normal(mu, sigma)
+        loss_hl = -dist.log_prob(target_hl_actions_flat).mean()
+
+        logits = self.lower_controller(states, target_hl_actions.detach())
+        logits = cast_tuple(logits)[0]
+
+        pred_actions = rearrange(logits, 'b n d -> (b n) d')
+        target_actions = rearrange(actions, 'b n -> (b n)').long()
+
+        if exists(mask):
+            pred_actions = pred_actions[flat_mask]
+            target_actions = target_actions[flat_mask]
+
+        loss_ll = F.cross_entropy(pred_actions, target_actions)
+        total_loss = loss_hl + loss_ll
+
+        if return_loss_breakdown:
+            return total_loss, (loss_hl.item(), loss_ll.item())
+        return total_loss
+
+    def get_action_and_value(self, state, action = None, cache = None, deterministic = False):
+        is_caching = exists(cache)
+        state_seq = rearrange(state, 'b d -> b 1 d')
+
+        pred_hl_action_params, intermediates = self.metacontroller(
+            state_seq,
+            cache = cache,
+            input_not_include_cache = is_caching,
+            return_intermediates = True
+        )
+        # the continuous wrapper returns out, layer_intermediates when return_intermediates=True
+        next_cache = intermediates
+
+        # strip sequence dim
+        state = rearrange(state_seq, 'b 1 d -> b d')
+        pred_hl_action_params = rearrange(pred_hl_action_params, 'b 1 d -> b d')
+
+        mu, log_var = pred_hl_action_params.chunk(2, dim = -1)
+        log_var = log_var.clamp(min = self.log_var_min, max = self.log_var_max)
+        sigma = torch.exp(0.5 * log_var)
+
+        if deterministic:
+            pred_hl_action = mu
+        else:
+            dist = torch.distributions.Normal(mu, sigma)
+            pred_hl_action = dist.sample()
+
+        action, log_prob, entropy, value, critic_logits = self.lower_controller.get_action_and_value(state, pred_hl_action.detach(), action = action)
+
+        return action, entropy, critic_logits, next_cache
+
 # gae using associative scan
 
 def calc_gae(
@@ -422,30 +603,30 @@ def evaluate_agent(
     if exists(vectorization_mode):
         assert not store_buffer, "store_buffer is not supported in vectorized mode"
         assert not render_videos, "render_videos is not supported in vectorized mode"
-        
+
         env = gym.make_vec(env_name, num_envs=num_episodes, vectorization_mode=vectorization_mode)
         state, _ = env.reset(seed=seed)
         done = np.zeros(num_episodes, dtype=bool)
         step_count = 0
         ep_rewards = np.zeros(num_episodes)
-        
+
         cache = None
         with torch.no_grad():
             while not done.all() and step_count < 1000:
                 state_tensor = tensor(state, dtype=torch.float32, device=device)
-                
+
                 kwargs = dict(cache = cache) if forward_has_cache else dict()
                 action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs)
-                
+
                 a = action.cpu().numpy()
                 next_state, reward, terminated, truncated, _ = env.step(a)
-                
+
                 ep_rewards += reward * (~done)
                 done = done | terminated | truncated
-                
+
                 state = next_state
                 step_count += 1
-                
+
         model = model.to(original_device)
         return np.mean(ep_rewards)
 
@@ -454,7 +635,8 @@ def evaluate_agent(
     pbar = tqdm(range(num_episodes), desc = 'Evaluating Agent', disable = quiet)
 
     for ep in pbar:
-        state, _ = env.reset(seed = seed + ep)
+        ep_seed = seed + ep if exists(seed) else None
+        state, _ = env.reset(seed = ep_seed)
 
         done = False
         step_count = 0
@@ -469,7 +651,7 @@ def evaluate_agent(
             while not done and step_count < 1000:
                 ep_states.append(state)
                 state_tensor = rearrange(tensor(state, dtype = torch.float32, device = device), 'd -> 1 d')
-                
+
                 kwargs = dict(cache = cache) if forward_has_cache else dict()
                 action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs)
 
@@ -539,10 +721,12 @@ def train_metacontroller(
     margin_of_error = 25.0,
     evaluate = False,
     train_discovery = False,
+    train_joint_metacontroller = False,
     train_evo_strat = False,
     evo_strat_generations = 100,
     evo_strat_population_size = 64,
     evo_strat_learning_rate = 0.01,
+    evo_strat_noise_scale = 0.03,
     skip_ppo_eval = False,
     skip_discovery_eval = False,
     max_discovery_steps = 1000,
@@ -553,6 +737,8 @@ def train_metacontroller(
     if use_wandb:
         if train_discovery:
             run_name = 'behavior_clone_phase'
+        elif train_joint_metacontroller:
+            run_name = 'joint_metacontroller_phase'
         elif train_evo_strat:
             run_name = 'evolutionary_strategy_phase'
         else:
@@ -740,14 +926,124 @@ def train_metacontroller(
 
         return
 
+    # joint metacontroller mode
+
+    if train_joint_metacontroller:
+        discovery_mod = DiscoveryModule().to(device)
+
+        if Path('discovery_evo_strat.pt').exists():
+            print('Loading existing discovery_evo_strat.pt for Joint Metacontroller optimization...')
+            discovery_mod.load_state_dict(torch.load('discovery_evo_strat.pt', map_location = device))
+        elif Path('discovery.pt').exists():
+            print('Loading existing discovery.pt for Joint Metacontroller optimization...')
+            discovery_mod.load_state_dict(torch.load('discovery.pt', map_location = device))
+
+        metacontroller = Metacontroller(discovery_mod = discovery_mod).to(device)
+        meta_optimizer = Adam(metacontroller.parameters(), lr = 3e-4)
+
+        metacontroller, meta_optimizer = accelerator.prepare(metacontroller, meta_optimizer)
+
+        best_eval_reward = -float('inf')
+        loop_count = 0
+        total_steps = 0
+        metacontroller_target = target_avg_cum_reward + margin_of_error
+
+        while best_eval_reward < metacontroller_target and total_steps < max_discovery_steps:
+            loop_count += 1
+            print(f'\n--- Joint Metacontroller Training Loop {loop_count} ---')
+
+            # gather expert trajectories
+            _, buffer = evaluate_agent(
+                model = discovery_mod,
+                num_episodes = eval_episodes,
+                video_folder = 'joint_gather_videos',
+                record_every = 0,
+                device = device,
+                seed = seed + loop_count * 1000,
+                store_buffer = True,
+                buffer_folder = './joint_metacontroller_buffer',
+                render_videos = False,
+                filter_top_percentile = filter_top_percentile,
+                forward_has_cache = True
+            )
+
+            dataloader = buffer.dataloader(batch_size = batch_size, fields = ('state', 'action'))
+            dataloader = accelerator.prepare(dataloader)
+
+            # train joint metacontroller
+            pbar_meta = tqdm(range(epochs), desc = 'Training Joint Metacontroller')
+
+            for ep in pbar_meta:
+                total_loss_sum = 0.
+                num_batches = 0
+
+                metacontroller.train()
+
+                for batch in dataloader:
+                    if total_steps >= max_discovery_steps:
+                        break
+
+                    states, actions, lens = [batch[k].to(device) for k in ('state', 'action', '_lens')]
+
+                    mask = rearrange(torch.arange(states.shape[1], device = device), 'n -> 1 n') < rearrange(lens, 'b -> b 1')
+
+                    loss = metacontroller(states, actions, mask = mask)
+
+                    meta_optimizer.zero_grad()
+                    accelerator.backward(loss)
+                    nn.utils.clip_grad_norm_(metacontroller.parameters(), 1.0)
+                    meta_optimizer.step()
+
+                    total_steps += 1
+                    total_loss_sum += loss.item()
+                    num_batches += 1
+
+                avg_loss = total_loss_sum / max(num_batches, 1)
+                pbar_meta.set_postfix({'Loss': f'{avg_loss:.4f}'})
+
+                if use_wandb:
+                    wandb.log(dict(metacontroller_loss = avg_loss))
+
+            unwrapped_mod = accelerator.unwrap_model(metacontroller)
+            unwrapped_mod.eval()
+
+            print('\nEvaluating Metacontroller...')
+            eval_reward = evaluate_agent(
+                model = unwrapped_mod,
+                num_episodes = eval_episodes,
+                video_folder = 'metacontroller_eval_videos',
+                record_every = 5,
+                device = device,
+                seed = seed + loop_count * 1000,
+                store_buffer = False,
+                forward_has_cache = True,
+                quiet = False
+            )
+
+            if use_wandb:
+                wandb.log(dict(metacontroller_eval_reward = eval_reward))
+
+            if eval_reward > best_eval_reward:
+                best_eval_reward = eval_reward
+                print(f'New best Metacontroller reward: {best_eval_reward:.2f}')
+                torch.save(unwrapped_mod.state_dict(), 'metacontroller_joint.pt')
+
+            if best_eval_reward >= metacontroller_target:
+                print('Metacontroller convergence target reached!')
+                break
+
+        print(f'Joint Metacontroller optimization finished! Best reward: {best_eval_reward:.2f}')
+
+        return
+
     # evolutionary strategies mode
 
     if train_evo_strat:
         torch.set_num_threads(1)
-        
+
         discovery_path = Path('discovery.pt')
         assert discovery_path.exists(), "Error: discovery.pt not found. Please train the discovery module first."
-        
+
         print('Loading existing discovery.pt for Evolutionary Strategies optimization...')
         discovery_mod = DiscoveryModule().to(device)
         discovery_mod.load_state_dict(torch.load('discovery.pt', map_location = device))
@@ -774,11 +1070,19 @@ def train_metacontroller(
                 video_folder = 'evo_strat_eval_videos',
                 record_every = 0,
                 device = device,
-                seed = seed,
+                seed = None,
                 render_videos = False,
                 forward_has_cache = True,
                 quiet = True
             )
+
+        def centered_rank_normalize(fitnesses):
+            shape = fitnesses.shape
+            flat_fitnesses = fitnesses.flatten()
+            ranks = torch.empty_like(flat_fitnesses)
+            ranks[flat_fitnesses.argsort()] = torch.arange(len(flat_fitnesses), dtype = fitnesses.dtype, device = fitnesses.device)
+            ranks = (ranks / (len(flat_fitnesses) - 1)) - 0.5
+            return ranks.reshape(shape)
 
         evo = EvoStrategy(
             model = discovery_mod,
@@ -786,15 +1090,18 @@ def train_metacontroller(
             num_generations = 1,
             noise_population_size = evo_strat_population_size,
             learning_rate = evo_strat_learning_rate,
+            noise_scale = evo_strat_noise_scale,
+            optimizer_klass = Adam,
+            fitness_to_weighted_factor = centered_rank_normalize,
             params_to_optimize = [discovery_mod.hnet.network]
         )
 
         best_eval_reward = -float('inf')
-        
+
         for gen in range(evo_strat_generations):
             print(f'\n--- Evo Strat Generation {gen+1}/{evo_strat_generations} ---')
             evo()
-            
+
             print('Evaluating deterministic performance...')
             eval_reward = evaluate_agent(
                 model = discovery_mod,
@@ -807,7 +1114,7 @@ def train_metacontroller(
                 forward_has_cache = True,
                 quiet = False
             )
-            
+
             if use_wandb:
                 wandb.log(dict(
                     evo_strat_eval_reward = eval_reward,
@@ -818,7 +1125,7 @@ def train_metacontroller(
                 best_eval_reward = eval_reward
                 print(f'New best Evo Strat reward: {best_eval_reward:.2f}')
                 torch.save(discovery_mod.state_dict(), 'discovery_evo_strat.pt')
-                
+
             if best_eval_reward >= 0:
                 print(f'Evo Strat reached target reward >= 0! (best: {best_eval_reward:.2f})')
                 break
