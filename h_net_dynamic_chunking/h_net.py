@@ -57,7 +57,7 @@ class HNet(Module):
         decoder: Module | dict,
         dim,
         dim_inner = None,
-        vq: VectorQuantize | None = None,
+        vq: VectorQuantize | dict | None = None,
         inner_network_rel_pos_kwarg: str | None = None,
         **dynamic_sequence_chunking_kwargs
     ):
@@ -101,6 +101,9 @@ class HNet(Module):
 
         # maybe do vector quantization
         # just use own library
+
+        if isinstance(vq, dict):
+            vq = VectorQuantize(**vq)
 
         assert not exists(vq) or isinstance(vq, VectorQuantize)
         self.vq = vq

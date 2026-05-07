@@ -5,14 +5,24 @@ default:
 train-expert:
     uv run train_metacontroller.py --use_wandb=True
 
-# Train the Discovery Module behavior cloning
-train-discovery:
-    uv run train_metacontroller.py --train_discovery=True --use_wandb=True --skip_ppo_eval=True
+# Train the Discovery Module behavior cloning (Continuous)
+train-discovery-continuous:
+    uv run train_metacontroller.py --train_discovery=True --use_wandb=True --skip_ppo_eval=True --discrete_high_actions=False --batch_size=32
 
-# Clear existing weights and train the Discovery Module from scratch
-train-discovery-from-scratch:
-    rm -f discovery.pt
-    uv run train_metacontroller.py --train_discovery=True --use_wandb=True --skip_ppo_eval=True
+# Train the Discovery Module behavior cloning (Discrete)
+train-discovery-discrete:
+    uv run train_metacontroller.py --train_discovery=True --use_wandb=True --skip_ppo_eval=True --discrete_high_actions=True --batch_size=32
+
+# Clear existing weights and train the Discovery Module from scratch (Continuous)
+train-discovery-continuous-from-scratch:
+    rm -f discovery_continuous.pt
+    uv run train_metacontroller.py --train_discovery=True --use_wandb=True --skip_ppo_eval=True --discrete_high_actions=False --batch_size=32
+
+# Clear existing weights and train the Discovery Module from scratch (Discrete)
+train-discovery-discrete-from-scratch:
+    rm -f discovery_discrete.pt
+    uv run train_metacontroller.py --train_discovery=True --use_wandb=True --skip_ppo_eval=True --discrete_high_actions=True --batch_size=32
+
 
 # Evaluate the trained agent
 evaluate:

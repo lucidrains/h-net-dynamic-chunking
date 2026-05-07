@@ -58,6 +58,7 @@ from memmap_replay_buffer import ReplayBuffer
 from torch_einops_utils.save_load import save_load
 from assoc_scan import AssocScan
 from x_transformers import Decoder
+from vector_quantize_pytorch import VectorQuantize
 from h_net_dynamic_chunking.h_net import HNet
 
 # helpers
@@ -109,6 +110,7 @@ class ActorCritic(nn.Module):
 
 # discovery module - hierarchical transformer with h-net dynamic chunking
 
+@save_load
 class DiscoveryModule(nn.Module):
     def __init__(
         self,
@@ -121,6 +123,8 @@ class DiscoveryModule(nn.Module):
         heads = 4,
         dim_head = 32,
         use_pope = True,
+        discrete_high_actions = False,
+        vq_codebook_size = 64,
         decoder_kwargs: dict | None = None,
         hnet_kwargs: dict | None = None,
         loss_weights: dict | None = None
@@ -162,11 +166,23 @@ class DiscoveryModule(nn.Module):
 
         self.hnet_prenorm = nn.LayerNorm(dim, elementwise_affine = False)
 
+        self.discrete_high_actions = discrete_high_actions
+        vq = None
+        if discrete_high_actions:
+            vq = VectorQuantize(
+                dim = dim,
+                codebook_size = vq_codebook_size,
+                use_cosine_sim = True
+            )
+
+        self.vq = vq
+
         self.hnet = HNet(
             encoder = nn.Identity(),
             network = Decoder(dim = dim, depth = hnet_depth, heads = heads, attn_dim_head = dim_head, **inner_decoder_kwargs),
             decoder = nn.Identity(),
             dim = dim,
+            vq = vq,
             **hnet_kwargs
         )
 
@@ -191,9 +207,13 @@ class DiscoveryModule(nn.Module):
         interleaved[:, 0::2] = state_repr
         interleaved[:, 1::2] = action_repr
 
+        interleaved_mask = None
+        if exists(mask):
+            interleaved_mask = repeat(mask, 'b n -> b (n 2)')
+
         # decoder1 over full interleaved stream
 
-        dec1_out = self.decoder1(interleaved)
+        dec1_out = self.decoder1(interleaved, mask = interleaved_mask)
 
         # hnet processes only state positions
 
@@ -206,7 +226,8 @@ class DiscoveryModule(nn.Module):
 
         if extract_high_level_actions:
             intermediates = hnet_ret.intermediates
-            return intermediates.input_downsampled_tokens, intermediates.chunk_lens
+            extracted = intermediates.quantized_downsampled_indices if self.discrete_high_actions else intermediates.input_downsampled_tokens
+            return extracted, intermediates.chunk_lens
 
         # re-interleave: hnet-processed states + raw actions
 
@@ -216,7 +237,7 @@ class DiscoveryModule(nn.Module):
 
         # decoder2 over re-interleaved stream
 
-        dec2_out = self.decoder2(reinterleaved)
+        dec2_out = self.decoder2(reinterleaved, mask = interleaved_mask)
 
         state_features = dec2_out[:, 0::2]
         action_features = dec2_out[:, 1::2]
@@ -298,7 +319,8 @@ class DiscoveryModule(nn.Module):
 
         if extract_high_level_actions:
             intermediates = hnet_ret.intermediates
-            return intermediates.input_downsampled_tokens, intermediates.chunk_lens, (cache_dec1, hnet_ret.next_cache, cache_dec2)
+            extracted = intermediates.quantized_downsampled_indices if self.discrete_high_actions else intermediates.input_downsampled_tokens
+            return extracted, intermediates.chunk_lens, (cache_dec1, hnet_ret.next_cache, cache_dec2)
 
         cache_hnet = hnet_ret.next_cache
 
@@ -440,14 +462,22 @@ class Metacontroller(nn.Module):
             rotary_pos_emb = False
         )
 
-        self.action_emb_proj = nn.Linear(discovery_dim, dim) if discovery_dim != dim else nn.Identity()
+        is_discrete = discovery_mod.discrete_high_actions
 
-        self.high_action_readout = Readout(
-            dim = dim,
-            num_continuous = discovery_dim,
-            continuous_log_var_embed = True,
-            continuous_dist_kwargs = dict(log_var_clamp_range = log_var_range)
-        )
+        if is_discrete:
+            self.action_emb_proj = nn.Embedding(discovery_mod.vq.codebook_size, dim)
+            self.high_action_readout = Readout(
+                dim = dim,
+                num_discrete = discovery_mod.vq.codebook_size
+            )
+        else:
+            self.action_emb_proj = nn.Linear(discovery_dim, dim) if discovery_dim != dim else nn.Identity()
+            self.high_action_readout = Readout(
+                dim = dim,
+                num_continuous = discovery_dim,
+                continuous_log_var_embed = True,
+                continuous_dist_kwargs = dict(log_var_clamp_range = log_var_range)
+            )
 
         self.state_readout = Readout(
             dim = dim,
@@ -460,7 +490,7 @@ class Metacontroller(nn.Module):
         self.lower_controller = ConditionedActorCritic(
             state_dim = state_dim,
             action_dim = action_dim,
-            condition_dim = discovery_dim,
+            condition_dim = dim if is_discrete else discovery_dim,
             **lower_controller_kwargs
         )
 
@@ -515,11 +545,12 @@ class Metacontroller(nn.Module):
             self.discovery_mod.eval()
             raw_target_high_actions, chunk_lens = self.discovery_mod(states, actions, extract_high_level_actions = True)
 
-            flat_target_high_actions = rearrange(raw_target_high_actions, 'b c d -> (b c) d')
+            flat_target_high_actions = rearrange(raw_target_high_actions, 'b c ... -> (b c) ...')
             flat_chunk_lens = rearrange(chunk_lens, 'b c -> (b c)')
 
             expanded = torch.repeat_interleave(flat_target_high_actions, flat_chunk_lens, dim = 0)
-            raw_target_high_actions = rearrange(expanded, '(b n) d -> b n d', b = batch)
+            pattern = '(b n) -> b n' if self.discovery_mod.discrete_high_actions else '(b n) d -> b n d'
+            raw_target_high_actions = rearrange(expanded, pattern, b = batch)
 
         # interleave states and high_actions
 
@@ -551,9 +582,11 @@ class Metacontroller(nn.Module):
 
         # cfg dropout + lower controller loss
 
+        is_discrete = self.discovery_mod.discrete_high_actions
+
         states_cond, high_cond = self.maybe_cfg_dropout(
             states,
-            raw_target_high_actions,
+            raw_target_high_actions if not is_discrete else action_tokens,
             force_drop_condition = force_drop_condition,
             force_drop_state = force_drop_state
         )
@@ -608,19 +641,27 @@ class Metacontroller(nn.Module):
             return_hiddens = True
         )
 
-        continuous_params = self.high_action_readout(rearrange(dec_out, 'b 1 d -> b d'))
-        dist = self.high_action_readout.continuous_dist.dist(continuous_params)
+        is_discrete = self.discovery_mod.discrete_high_actions
 
-        if high_temperature == 0.:
-            pred_high_action = dist.mean
+        if is_discrete:
+            # high_action_readout is a Discrete Readout
+            pred_high_action = self.high_action_readout.sample(rearrange(dec_out, 'b 1 d -> b d'), temperature=high_temperature)
+            action_token = self.action_emb_proj(pred_high_action.detach())
+            action_token = rearrange(action_token, 'b d -> b 1 d')
         else:
-            if high_temperature > 0. and high_temperature != 1.:
-                dist = torch.distributions.Normal(dist.mean, dist.stddev * high_temperature)
+            continuous_params = self.high_action_readout(rearrange(dec_out, 'b 1 d -> b d'))
+            dist = self.high_action_readout.continuous_dist.dist(continuous_params)
 
-            pred_high_action = dist.sample()
+            if high_temperature == 0.:
+                pred_high_action = dist.mean
+            else:
+                if high_temperature > 0. and high_temperature != 1.:
+                    dist = torch.distributions.Normal(dist.mean, dist.stddev * high_temperature)
 
-        # project predicted raw action into transformer token space
-        action_token = self.action_emb_proj(rearrange(pred_high_action.detach(), 'b d -> b 1 d'))
+                pred_high_action = dist.sample()
+
+            # project predicted raw action into transformer token space
+            action_token = self.action_emb_proj(rearrange(pred_high_action.detach(), 'b d -> b 1 d'))
 
         _, transformer_cache = self.metacontroller(
             action_token,
@@ -632,7 +673,7 @@ class Metacontroller(nn.Module):
         # cfg dropout for lower controller uses the raw predicted high action
         state_cond, high_cond = self.maybe_cfg_dropout(
             rearrange(state, 'b d -> b 1 d'),
-            rearrange(pred_high_action.detach(), 'b d -> b 1 d'),
+            action_token if is_discrete else rearrange(pred_high_action.detach(), 'b d -> b 1 d'),
             force_drop_condition = force_drop_condition,
             force_drop_state = force_drop_state
         )
@@ -694,7 +735,8 @@ def evaluate_agent(
     vectorization_mode = None,
     temperature = 1.,
     high_temperature = 1.,
-    max_timesteps = 1000
+    max_timesteps = 1000,
+    desc = 'Evaluating Agent'
 ):
     shutil.rmtree(video_folder, ignore_errors = True)
 
@@ -728,7 +770,7 @@ def evaluate_agent(
             )
         )
 
-    unwrapped_model = getattr(model, 'model', model)
+    unwrapped_model = model.model if hasattr(model, 'model') else model
     unwrapped_model.eval()
 
     if exists(vectorization_mode):
@@ -766,7 +808,7 @@ def evaluate_agent(
 
     ep_rewards = []
     episodes_data = []
-    pbar = tqdm(range(num_episodes), desc = 'Evaluating Agent', disable = quiet)
+    pbar = tqdm(range(num_episodes), desc = desc, disable = quiet)
 
     for ep in pbar:
         ep_seed = seed + ep if exists(seed) else None
@@ -870,7 +912,8 @@ def train_metacontroller(
     max_timesteps = 1000,
     load_path = './metacontroller_agent.pt',
     eval_episodes = 20,
-    filter_top_percentile = 0.5
+    filter_top_percentile = 0.5,
+    discrete_high_actions = False
 ):
     if use_wandb:
         if train_discovery:
@@ -886,6 +929,9 @@ def train_metacontroller(
             clip_coef = clip_coef, entropy_coef = entropy_coef, value_coef = value_coef,
             epochs = epochs, batch_size = batch_size
         ))
+
+    discovery_pt_name = 'discovery_discrete.pt' if discrete_high_actions else 'discovery_continuous.pt'
+    discovery_evo_pt_name = 'discovery_evo_strat_discrete.pt' if discrete_high_actions else 'discovery_evo_strat_continuous.pt'
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -947,11 +993,11 @@ def train_metacontroller(
         else:
             print('Skipping PPO initial evaluation as requested.')
 
-        discovery_mod = DiscoveryModule().to(device)
+        discovery_mod = DiscoveryModule(discrete_high_actions=discrete_high_actions).to(device)
 
-        if Path('discovery.pt').exists():
-            print('Loading existing discovery.pt...')
-            discovery_mod.load_state_dict(torch.load('discovery.pt', map_location = device))
+        if Path(discovery_pt_name).exists():
+            print(f'Loading existing {discovery_pt_name}...')
+            discovery_mod.load_state_dict(torch.load(discovery_pt_name, map_location = device))
 
         disc_optimizer = Adam(discovery_mod.parameters(), lr = 1e-4)
         discovery_mod, disc_optimizer = accelerator.prepare(discovery_mod, disc_optimizer)
@@ -967,9 +1013,11 @@ def train_metacontroller(
 
             # gather expert trajectories
 
+            gather_episodes = int(batch_size / filter_top_percentile)
+
             _, buffer = evaluate_agent(
                 model = model,
-                num_episodes = eval_episodes,
+                num_episodes = gather_episodes,
                 video_folder = 'discovery_gather_videos',
                 record_every = 0,
                 device = device,
@@ -977,7 +1025,8 @@ def train_metacontroller(
                 store_buffer = True,
                 buffer_folder = './discovery_buffer',
                 render_videos = False,
-                filter_top_percentile = filter_top_percentile
+                filter_top_percentile = filter_top_percentile,
+                desc = 'Gathering Expert Trajectories'
             )
 
             dataloader = buffer.dataloader(batch_size = batch_size, fields = ('state', 'action'))
@@ -1028,7 +1077,7 @@ def train_metacontroller(
 
             eval_reward = evaluate_agent(
                 model = unwrapped_mod,
-                num_episodes = 20,
+                num_episodes = eval_episodes,
                 video_folder = 'discovery_eval_videos',
                 record_every = 5,
                 device = device,
@@ -1053,8 +1102,8 @@ def train_metacontroller(
                 best_eval_reward = eval_reward
                 print(f'New best eval reward: {best_eval_reward:.2f}')
 
-                torch.save(unwrapped_mod.state_dict(), 'discovery.pt')
-                print('Saved new best discovery.pt!')
+                torch.save(unwrapped_mod.state_dict(), discovery_pt_name)
+                print(f'Saved new best {discovery_pt_name}!')
 
             if best_eval_reward >= discovery_target:
                 print(f'DiscoveryModule reached target reward >= {discovery_target:.2f}! (best: {best_eval_reward:.2f})')
@@ -1067,14 +1116,14 @@ def train_metacontroller(
     # joint metacontroller mode
 
     if train_joint_metacontroller:
-        discovery_mod = DiscoveryModule().to(device)
+        discovery_mod = DiscoveryModule(discrete_high_actions=discrete_high_actions).to(device)
 
-        if Path('discovery_evo_strat.pt').exists():
-            print('Loading existing discovery_evo_strat.pt for Joint Metacontroller optimization...')
-            discovery_mod.load_state_dict(torch.load('discovery_evo_strat.pt', map_location = device))
-        elif Path('discovery.pt').exists():
-            print('Loading existing discovery.pt for Joint Metacontroller optimization...')
-            discovery_mod.load_state_dict(torch.load('discovery.pt', map_location = device))
+        if Path(discovery_evo_pt_name).exists():
+            print(f'Loading existing {discovery_evo_pt_name} for Joint Metacontroller optimization...')
+            discovery_mod.load_state_dict(torch.load(discovery_evo_pt_name, map_location = device))
+        elif Path(discovery_pt_name).exists():
+            print(f'Loading existing {discovery_pt_name} for Joint Metacontroller optimization...')
+            discovery_mod.load_state_dict(torch.load(discovery_pt_name, map_location = device))
 
         metacontroller = Metacontroller(discovery_mod = discovery_mod).to(device)
         meta_optimizer = Adam(metacontroller.parameters(), lr = 3e-4)
@@ -1095,9 +1144,10 @@ def train_metacontroller(
                 print("Skipping discovery eval and loading buffer...")
                 buffer = ReplayBuffer.from_folder('./joint_metacontroller_buffer')
             else:
+                gather_episodes = int(batch_size / filter_top_percentile)
                 _, buffer = evaluate_agent(
                     model = discovery_mod,
-                    num_episodes = eval_episodes,
+                    num_episodes = gather_episodes,
                     video_folder = 'joint_gather_videos',
                     record_every = 0,
                     device = device,
@@ -1107,7 +1157,8 @@ def train_metacontroller(
                     render_videos = False,
                     filter_top_percentile = filter_top_percentile,
                     forward_has_cache = True,
-                    max_timesteps = max_timesteps
+                    max_timesteps = max_timesteps,
+                    desc = 'Gathering Expert Trajectories'
                 )
 
             dataloader = buffer.dataloader(batch_size = batch_size, fields = ('state', 'action'))
@@ -1184,12 +1235,12 @@ def train_metacontroller(
     if train_evo_strat:
         torch.set_num_threads(1)
 
-        discovery_path = Path('discovery.pt')
-        assert discovery_path.exists(), "Error: discovery.pt not found. Please train the discovery module first."
+        discovery_path = Path(discovery_pt_name)
+        assert discovery_path.exists(), f"Error: {discovery_pt_name} not found. Please train the discovery module first."
 
-        print('Loading existing discovery.pt for Evolutionary Strategies optimization...')
-        discovery_mod = DiscoveryModule().to(device)
-        discovery_mod.load_state_dict(torch.load('discovery.pt', map_location = device))
+        print(f'Loading existing {discovery_pt_name} for Evolutionary Strategies optimization...')
+        discovery_mod = DiscoveryModule(discrete_high_actions=discrete_high_actions).to(device)
+        discovery_mod.load_state_dict(torch.load(discovery_pt_name, map_location = device))
 
         if not skip_discovery_eval:
             print('Running initial validation of discovery.pt...')
@@ -1267,7 +1318,7 @@ def train_metacontroller(
             if eval_reward > best_eval_reward:
                 best_eval_reward = eval_reward
                 print(f'New best Evo Strat reward: {best_eval_reward:.2f}')
-                torch.save(discovery_mod.state_dict(), 'discovery_evo_strat.pt')
+                torch.save(discovery_mod.state_dict(), discovery_evo_pt_name)
 
             if best_eval_reward >= 0:
                 print(f'Evo Strat reached target reward >= 0! (best: {best_eval_reward:.2f})')

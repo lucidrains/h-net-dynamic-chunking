@@ -153,16 +153,22 @@ def test_access_downsampled_from_h_net_intermediate():
     assert batch == 1 and dim == 512 and down_seq <= 1024
 
 @param('use_vq', (False, True))
-def test_vq_and_fetch_indices_from_intermediates(use_vq):
+@param('vq_as_dict', (False, True))
+def test_vq_and_fetch_indices_from_intermediates(use_vq, vq_as_dict):
     from torch import nn
     from vector_quantize_pytorch import VectorQuantize
     from h_net_dynamic_chunking.h_net import HNet, exists
 
-    vq = VectorQuantize(
+    vq_kwargs = dict(
         dim = 1024,
         codebook_size = 256,
         use_cosine_sim = True
-    ) if use_vq else None
+    )
+
+    if use_vq:
+        vq = vq_kwargs if vq_as_dict else VectorQuantize(**vq_kwargs)
+    else:
+        vq = None
 
     net = HNet(
         nn.Identity(),

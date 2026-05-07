@@ -1,6 +1,6 @@
 [project]
 name = "h-net-dynamic-chunking"
-version = "0.5.2"
+version = "0.5.3"
 description = "H-Net Dynamic Chunking Modules"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -29,7 +29,20 @@ dependencies = [
     "vector-quantize-pytorch>=1.28.2",
     "torch>=2.5",
     "torch-einops-utils>=0.0.32",
-    "x-transformers"
+    "x-transformers",
+    "tqdm>=4.67.3",
+    "fire>=0.7.1",
+    "wandb>=0.26.1",
+    "accelerate>=1.10.1",
+    "gymnasium>=1.1.1",
+    "tensorboard>=2.20.0",
+    "numpy>=2.0.2",
+    "scipy>=1.13.1",
+    "x-evolution>=0.1.31",
+    "x-mlps-pytorch>=0.3.4",
+    "hl-gauss-pytorch>=0.2.3",
+    "discrete-continuous-embed-readout>=0.2.7",
+    "memmap-replay-buffer>=0.0.29",
 ]
 
 [project.urls]
