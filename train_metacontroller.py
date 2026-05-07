@@ -460,7 +460,7 @@ class Metacontroller(nn.Module):
             expanded_flat_targets = torch.repeat_interleave(flat_target_hl_actions, flat_chunk_lens, dim = 0)
             target_hl_actions = rearrange(expanded_flat_targets, '(b n) d -> b n d', b = states.shape[0])
 
-        pred_hl_actions = self.metacontroller(states)
+        pred_hl_actions = self.metacontroller(states, mask = mask)
 
         if exists(mask):
             flat_mask = rearrange(mask, 'b n -> (b n)')
