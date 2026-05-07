@@ -153,20 +153,16 @@ def test_access_downsampled_from_h_net_intermediate():
     assert batch == 1 and dim == 512 and down_seq <= 1024
 
 @param('use_vq', (False, True))
-@param('vq_as_dict', (False, True))
-def test_vq_and_fetch_indices_from_intermediates(use_vq, vq_as_dict):
+def test_vq_and_fetch_indices_from_intermediates(use_vq):
     from torch import nn
     from vector_quantize_pytorch import VectorQuantize
     from h_net_dynamic_chunking.h_net import HNet, exists
 
-    vq_kwargs = dict(
-        dim = 1024,
-        codebook_size = 256,
-        use_cosine_sim = True
-    )
-
     if use_vq:
-        vq = vq_kwargs if vq_as_dict else VectorQuantize(**vq_kwargs)
+        vq = dict(
+            dim = 512,
+            codebook_size = 256
+        )
     else:
         vq = None
 
@@ -187,6 +183,8 @@ def test_vq_and_fetch_indices_from_intermediates(use_vq, vq_as_dict):
     if use_vq:
         assert exists(indices)
         assert indices.ndim == 2
+        downsampled = out.intermediates.input_downsampled_tokens
+        assert indices.shape == downsampled.shape[:2], f'indices shape {indices.shape} does not match downsampled chunks {downsampled.shape[:2]}'
     else:
         assert not exists(indices)
 

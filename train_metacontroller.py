@@ -125,6 +125,8 @@ class DiscoveryModule(nn.Module):
         use_pope = True,
         discrete_high_actions = False,
         vq_codebook_size = 64,
+        vq_decay = 0.8,
+        vq_commitment_weight = 1.,
         decoder_kwargs: dict | None = None,
         hnet_kwargs: dict | None = None,
         loss_weights: dict | None = None
@@ -172,7 +174,9 @@ class DiscoveryModule(nn.Module):
             vq = VectorQuantize(
                 dim = dim,
                 codebook_size = vq_codebook_size,
-                use_cosine_sim = True
+                decay = vq_decay,
+                commitment_weight = vq_commitment_weight,
+                rotation_trick = True
             )
 
         self.vq = vq
@@ -913,7 +917,10 @@ def train_metacontroller(
     load_path = './metacontroller_agent.pt',
     eval_episodes = 20,
     filter_top_percentile = 0.5,
-    discrete_high_actions = False
+    discrete_high_actions = False,
+    vq_codebook_size = 64,
+    vq_decay = 0.8,
+    vq_commitment_weight = 1.
 ):
     if use_wandb:
         if train_discovery:
@@ -993,7 +1000,12 @@ def train_metacontroller(
         else:
             print('Skipping PPO initial evaluation as requested.')
 
-        discovery_mod = DiscoveryModule(discrete_high_actions=discrete_high_actions).to(device)
+        discovery_mod = DiscoveryModule(
+            discrete_high_actions = discrete_high_actions,
+            vq_codebook_size = vq_codebook_size,
+            vq_decay = vq_decay,
+            vq_commitment_weight = vq_commitment_weight
+        ).to(device)
 
         if Path(discovery_pt_name).exists():
             print(f'Loading existing {discovery_pt_name}...')
@@ -1116,7 +1128,12 @@ def train_metacontroller(
     # joint metacontroller mode
 
     if train_joint_metacontroller:
-        discovery_mod = DiscoveryModule(discrete_high_actions=discrete_high_actions).to(device)
+        discovery_mod = DiscoveryModule(
+            discrete_high_actions = discrete_high_actions,
+            vq_codebook_size = vq_codebook_size,
+            vq_decay = vq_decay,
+            vq_commitment_weight = vq_commitment_weight
+        ).to(device)
 
         if Path(discovery_evo_pt_name).exists():
             print(f'Loading existing {discovery_evo_pt_name} for Joint Metacontroller optimization...')
@@ -1239,7 +1256,12 @@ def train_metacontroller(
         assert discovery_path.exists(), f"Error: {discovery_pt_name} not found. Please train the discovery module first."
 
         print(f'Loading existing {discovery_pt_name} for Evolutionary Strategies optimization...')
-        discovery_mod = DiscoveryModule(discrete_high_actions=discrete_high_actions).to(device)
+        discovery_mod = DiscoveryModule(
+            discrete_high_actions = discrete_high_actions,
+            vq_codebook_size = vq_codebook_size,
+            vq_decay = vq_decay,
+            vq_commitment_weight = vq_commitment_weight
+        ).to(device)
         discovery_mod.load_state_dict(torch.load(discovery_pt_name, map_location = device))
 
         if not skip_discovery_eval:

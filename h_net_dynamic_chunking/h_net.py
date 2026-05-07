@@ -4,6 +4,7 @@ from collections import namedtuple
 
 import inspect
 
+import torch
 from torch import nn, tensor
 from torch.nn import Module
 
@@ -24,6 +25,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def is_empty(t):
+    return t.numel() == 0
 
 def cast_tuple(t):
     return t if type(t) is tuple else (t,)
@@ -129,6 +133,10 @@ class HNet(Module):
         if 'input_not_include_cache' in inner_sig or 'kwargs' in inner_sig:
             self._inner_cache_kwargs['input_not_include_cache'] = True
 
+    @property
+    def device(self):
+        return self.zero.device
+
     def forward(
         self,
         tokens,
@@ -139,7 +147,6 @@ class HNet(Module):
         is_caching = exists(cache) or return_hiddens
 
         assert not (self._is_multi_head and is_caching), 'caching is not yet supported for multi-head dynamic sequence chunking'
-
 
         # unpack cache, ensuring we don't mutate the user's input cache
 
@@ -159,6 +166,13 @@ class HNet(Module):
         else:
             encoded = self.encoder(tokens)
 
+        # maybe quantize before downsampling
+
+        maybe_commit_loss = self.zero
+
+        if exists(self.vq):
+            encoded, indices, maybe_commit_loss = self.vq(encoded)
+
         # downsample via dynamic chunker
 
         (downsampled, upsample, aux_ratio_loss), intermediate = self.dynamic_sequence_chunker(
@@ -169,6 +183,28 @@ class HNet(Module):
 
         maybe_projected_downsampled = self.proj_in(downsampled)
 
+        if exists(self.vq):
+            batch = maybe_projected_downsampled.shape[0]
+            has_chunks = not is_empty(maybe_projected_downsampled)
+
+            quantized_downsampled_indices = torch.empty((batch, 0), dtype = torch.long, device = self.device)
+
+            if has_chunks:
+                num_chunks = intermediate.boundary_mask.long().sum(dim = -1)
+                boundary_indices = indices[intermediate.boundary_mask]
+
+                indices_nt = torch.nested.nested_tensor(
+                    boundary_indices.split(num_chunks.tolist()),
+                    layout = torch.jagged,
+                    device = self.device
+                )
+
+                quantized_downsampled_indices = indices_nt.to_padded_tensor(padding = -1)
+
+            intermediate = intermediate._replace(
+                quantized_downsampled_indices = quantized_downsampled_indices
+            )
+
         network_kwargs = dict()
 
         # maybe pass boundary positions to inner network
@@ -178,16 +214,9 @@ class HNet(Module):
             boundary_positions = exclusive_cumsum(intermediate.chunk_lens)
             network_kwargs[self.inner_network_rel_pos_kwarg] = boundary_positions
 
-        # maybe quantize
-
-        maybe_commit_loss = self.zero
-
-        if exists(self.vq):
-            maybe_projected_downsampled, indices, maybe_commit_loss = self.vq(maybe_projected_downsampled)
-
         # inner network - skip if no boundaries this step (cache handles output)
 
-        has_tokens_for_inner = maybe_projected_downsampled.shape[1] > 0
+        has_tokens_for_inner = not is_empty(maybe_projected_downsampled)
 
         inner_intermediates = ()
         maybe_inner_aux_ratio_loss = self.zero
@@ -235,9 +264,6 @@ class HNet(Module):
                 chunker = chunker_cache,
                 upsample = upsample_cache
             )
-
-        if exists(self.vq):
-            intermediate = intermediate._replace(quantized_downsampled_indices = indices)
 
         intermediate_out = intermediate
 
