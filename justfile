@@ -17,3 +17,7 @@ train-discovery-from-scratch:
 # Evaluate the trained agent
 evaluate:
     uv run train_metacontroller.py --evaluate=True
+
+# Optimize the Discovery Module inner hierarchical network with Evolutionary Strategies
+train-evo-strat:
+    uv run train_metacontroller.py --train_evo_strat=True --use_wandb=True --cpu=True

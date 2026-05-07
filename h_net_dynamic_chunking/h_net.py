@@ -13,7 +13,9 @@ from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicSequenceChunker
 from h_net_dynamic_chunking.multi_head_h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
 
 from vector_quantize_pytorch import VectorQuantize
+
 from x_transformers import Decoder
+from x_transformers.x_transformers import AttentionLayers
 
 # helpers
 
@@ -33,10 +35,10 @@ def pick(d, *keys):
 # check if a module's forward accepts cache and return_hiddens kwargs
 
 def accepts_cache(module):
-    if isinstance(module, Decoder):
+    if isinstance(module, (Decoder, AttentionLayers)):
         return True
     sig = inspect.signature(module.forward).parameters
-    return 'cache' in sig and 'return_hiddens' in sig
+    return 'cache' in sig and ('return_hiddens' in sig or 'kwargs' in sig)
 
 # classes
 
@@ -108,13 +110,21 @@ class HNet(Module):
         # determine cache support for encoder, decoder, and inner network at init time
 
         is_nested_hnet = isinstance(self.network, HNet)
-
         self._is_nested_hnet = is_nested_hnet
 
         self._encoder_accepts_cache = accepts_cache(self.encoder)
         self._decoder_accepts_cache = accepts_cache(self.decoder)
         self._inner_accepts_cache = is_nested_hnet or accepts_cache(self.network)
         self._is_multi_head = heads > 1
+
+        # inner cache kwargs
+
+        inner_sig = inspect.signature(self.network.forward).parameters
+
+        self._inner_cache_kwargs = dict(return_hiddens = True)
+
+        if 'input_not_include_cache' in inner_sig or 'kwargs' in inner_sig:
+            self._inner_cache_kwargs['input_not_include_cache'] = True
 
     def forward(
         self,
@@ -192,7 +202,8 @@ class HNet(Module):
 
         else:
             if self._inner_accepts_cache and is_caching:
-                inner_network_output, inner_cache = self.network(maybe_projected_downsampled, cache = inner_cache, return_hiddens = True, **network_kwargs)
+                inner_kwargs = {**self._inner_cache_kwargs, **network_kwargs}
+                inner_network_output, inner_cache = self.network(maybe_projected_downsampled, cache = inner_cache, **inner_kwargs)
             else:
                 inner_network_output = self.network(maybe_projected_downsampled, **network_kwargs)
 

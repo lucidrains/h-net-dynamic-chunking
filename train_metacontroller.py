@@ -47,6 +47,8 @@ from einops import rearrange
 
 import gymnasium as gym
 
+from x_evolution import EvoStrategy
+
 from x_mlps_pytorch import MLP
 from hl_gauss_pytorch import HLGaussLoss
 from discrete_continuous_embed_readout import Readout
@@ -376,7 +378,9 @@ def evaluate_agent(
     buffer_folder = './discovery_buffer',
     render_videos = True,
     forward_has_cache = False,
-    filter_top_percentile = 0.5
+    filter_top_percentile = 0.5,
+    quiet = False,
+    vectorization_mode = None
 ):
     shutil.rmtree(video_folder, ignore_errors = True)
 
@@ -410,10 +414,42 @@ def evaluate_agent(
             )
         )
 
-    model.eval()
+    unwrapped_model = getattr(model, 'model', model)
+    unwrapped_model.eval()
+
+    if exists(vectorization_mode):
+        assert not store_buffer, "store_buffer is not supported in vectorized mode"
+        assert not render_videos, "render_videos is not supported in vectorized mode"
+        
+        env = gym.make_vec(env_name, num_envs=num_episodes, vectorization_mode=vectorization_mode)
+        state, _ = env.reset(seed=seed)
+        done = np.zeros(num_episodes, dtype=bool)
+        step_count = 0
+        ep_rewards = np.zeros(num_episodes)
+        
+        cache = None
+        with torch.no_grad():
+            while not done.all() and step_count < 1000:
+                state_tensor = tensor(state, dtype=torch.float32, device=device)
+                
+                kwargs = dict(cache = cache) if forward_has_cache else dict()
+                action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs)
+                
+                a = action.cpu().numpy()
+                next_state, reward, terminated, truncated, _ = env.step(a)
+                
+                ep_rewards += reward * (~done)
+                done = done | terminated | truncated
+                
+                state = next_state
+                step_count += 1
+                
+        model = model.to(original_device)
+        return np.mean(ep_rewards)
+
     ep_rewards = []
     episodes_data = []
-    pbar = tqdm(range(num_episodes), desc = 'Evaluating Agent')
+    pbar = tqdm(range(num_episodes), desc = 'Evaluating Agent', disable = quiet)
 
     for ep in pbar:
         state, _ = env.reset(seed = seed + ep)
@@ -431,11 +467,9 @@ def evaluate_agent(
             while not done and step_count < 1000:
                 ep_states.append(state)
                 state_tensor = rearrange(tensor(state, dtype = torch.float32, device = device), 'd -> 1 d')
-
-                if forward_has_cache:
-                    action, *_, cache = model.get_action_and_value(state_tensor, cache = cache)
-                else:
-                    action, *_ = model.get_action_and_value(state_tensor)
+                
+                kwargs = dict(cache = cache) if forward_has_cache else dict()
+                action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs)
 
                 a = action.item()
                 ep_actions.append(a)
@@ -454,7 +488,8 @@ def evaluate_agent(
             episodes_data.append((ep_states, ep_actions, ep_reward_sum))
 
     avg_reward = np.mean(ep_rewards)
-    print(f'\nEvaluation Complete! Average Reward over {num_episodes} episodes: {avg_reward:.2f}')
+    if not quiet:
+        print(f'\nEvaluation Complete! Average Reward over {num_episodes} episodes: {avg_reward:.2f}')
 
     if store_buffer:
         episodes_data.sort(key = lambda x: x[2], reverse = True)
@@ -462,14 +497,16 @@ def evaluate_agent(
         filtered_episodes = episodes_data[:top_k]
 
         filtered_avg_reward = np.mean([x[2] for x in filtered_episodes])
-        print(f'Storing top {top_k} episodes with average reward: {filtered_avg_reward:.2f}')
+        if not quiet:
+            print(f'Storing top {top_k} episodes with average reward: {filtered_avg_reward:.2f}')
 
         for ep_states, ep_actions, reward in filtered_episodes:
             with buffer.one_episode():
                 for t in range(len(ep_states)):
                     buffer.store(state = ep_states[t], action = ep_actions[t])
 
-    print(f'Videos saved to: {Path(video_folder).absolute()}')
+    if not quiet:
+        print(f'Videos saved to: {Path(video_folder).absolute()}')
 
     env.close()
     model = model.to(original_device)
@@ -500,14 +537,24 @@ def train_metacontroller(
     margin_of_error = 25.0,
     evaluate = False,
     train_discovery = False,
+    train_evo_strat = False,
+    evo_strat_generations = 100,
+    evo_strat_population_size = 64,
+    evo_strat_learning_rate = 0.01,
     skip_ppo_eval = False,
+    skip_discovery_eval = False,
     max_discovery_steps = 1000,
     load_path = './metacontroller_agent.pt',
     eval_episodes = 20,
     filter_top_percentile = 0.5
 ):
     if use_wandb:
-        run_name = 'behavior_clone_phase' if train_discovery else 'initial_policy_optimization'
+        if train_discovery:
+            run_name = 'behavior_clone_phase'
+        elif train_evo_strat:
+            run_name = 'evolutionary_strategy_phase'
+        else:
+            run_name = 'initial_policy_optimization'
         wandb.init(project = 'h-net-dynamic-chunking', name = run_name, config = dict(
             lr = lr, gamma = gamma, gae_lambda = gae_lambda,
             clip_coef = clip_coef, entropy_coef = entropy_coef, value_coef = value_coef,
@@ -688,6 +735,91 @@ def train_metacontroller(
                 break
             else:
                 print('Behavior cloning target not yet met. Re-gathering data and continuing training...')
+
+        return
+
+    # evolutionary strategies mode
+
+    if train_evo_strat:
+        torch.set_num_threads(1)
+        
+        discovery_path = Path('discovery.pt')
+        assert discovery_path.exists(), "Error: discovery.pt not found. Please train the discovery module first."
+        
+        print('Loading existing discovery.pt for Evolutionary Strategies optimization...')
+        discovery_mod = DiscoveryModule().to(device)
+        discovery_mod.load_state_dict(torch.load('discovery.pt', map_location = device))
+
+        if not skip_discovery_eval:
+            print('Running initial validation of discovery.pt...')
+            initial_eval_reward = evaluate_agent(
+                model = discovery_mod,
+                num_episodes = 20,
+                video_folder = 'evo_strat_initial_eval_videos',
+                record_every = 0,
+                device = device,
+                seed = seed,
+                render_videos = False,
+                forward_has_cache = True,
+                vectorization_mode = 'sync'
+            )
+            print(f'Initial DiscoveryModule Reward: {initial_eval_reward:.2f}')
+
+        def evo_strat_environment(m):
+            return evaluate_agent(
+                model = m,
+                num_episodes = 1,
+                video_folder = 'evo_strat_eval_videos',
+                record_every = 0,
+                device = device,
+                seed = seed,
+                render_videos = False,
+                forward_has_cache = True,
+                quiet = True
+            )
+
+        evo = EvoStrategy(
+            model = discovery_mod,
+            environment = evo_strat_environment,
+            num_generations = 1,
+            noise_population_size = evo_strat_population_size,
+            learning_rate = evo_strat_learning_rate,
+            params_to_optimize = [discovery_mod.hnet.network]
+        )
+
+        best_eval_reward = -float('inf')
+        
+        for gen in range(evo_strat_generations):
+            print(f'\n--- Evo Strat Generation {gen+1}/{evo_strat_generations} ---')
+            evo()
+            
+            print('Evaluating deterministic performance...')
+            eval_reward = evaluate_agent(
+                model = discovery_mod,
+                num_episodes = 20,
+                video_folder = 'evo_strat_eval_videos',
+                record_every = 5,
+                device = device,
+                seed = seed + gen * 1000,
+                store_buffer = False,
+                forward_has_cache = True,
+                quiet = False
+            )
+            
+            if use_wandb:
+                wandb.log(dict(
+                    evo_strat_eval_reward = eval_reward,
+                    evo_strat_generation = gen
+                ))
+
+            if eval_reward > best_eval_reward:
+                best_eval_reward = eval_reward
+                print(f'New best Evo Strat reward: {best_eval_reward:.2f}')
+                torch.save(discovery_mod.state_dict(), 'discovery_evo_strat.pt')
+                
+            if best_eval_reward >= 0:
+                print(f'Evo Strat reached target reward >= 0! (best: {best_eval_reward:.2f})')
+                break
 
         return
 
