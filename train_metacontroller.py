@@ -45,7 +45,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
 
-from einops import rearrange
+from einops import rearrange, repeat
 
 import gymnasium as gym
 
@@ -206,8 +206,6 @@ class DiscoveryModule(nn.Module):
 
         if extract_high_level_actions:
             intermediates = hnet_ret.intermediates
-            if isinstance(intermediates, tuple) and not hasattr(intermediates, 'input_downsampled_tokens'):
-                intermediates = intermediates[0]
             return intermediates.input_downsampled_tokens, intermediates.chunk_lens
 
         # re-interleave: hnet-processed states + raw actions
@@ -300,8 +298,6 @@ class DiscoveryModule(nn.Module):
 
         if extract_high_level_actions:
             intermediates = hnet_ret.intermediates
-            if isinstance(intermediates, tuple) and not hasattr(intermediates, 'input_downsampled_tokens'):
-                intermediates = intermediates[0]
             return intermediates.input_downsampled_tokens, intermediates.chunk_lens, (cache_dec1, hnet_ret.next_cache, cache_dec2)
 
         cache_hnet = hnet_ret.next_cache
@@ -351,7 +347,7 @@ class ConditionedActorCritic(nn.Module):
         self,
         state_dim = 8,
         action_dim = 4,
-        condition_dim = 128,
+        condition_dim = 96,
         actor_hidden_dims = (64, 64),
         critic_hidden_dims = (64, 256),
         hl_gauss_min_value = -400.,
@@ -360,8 +356,7 @@ class ConditionedActorCritic(nn.Module):
     ):
         super().__init__()
 
-        # actor - mirrors original ActorCritic MLP(state_dim, 64, 64, 64)
-        # condition is projected and summed at the input
+        # actor
 
         first_actor_dim = actor_hidden_dims[0]
         self.actor_state_proj = nn.Linear(state_dim, first_actor_dim)
@@ -370,7 +365,7 @@ class ConditionedActorCritic(nn.Module):
         self.actor_mlp = MLP(first_actor_dim, *actor_hidden_dims)
         self.actor_readout = Readout(dim = actor_hidden_dims[-1], num_discrete = action_dim)
 
-        # critic - mirrors original ActorCritic MLP(state_dim, 64, 64, 256)
+        # critic
 
         self.hl_gauss_loss = HLGaussLoss(
             min_value = hl_gauss_min_value,
@@ -413,10 +408,10 @@ class Metacontroller(nn.Module):
         discovery_mod,
         state_dim = 8,
         action_dim = 4,
-        dim = 128,
+        dim = 96,
         max_seq_len = 1000,
-        decoder_depth = 2,
-        decoder_heads = 4,
+        decoder_depth = 4,
+        decoder_heads = 8,
         decoder_dim_head = 32,
         log_var_min = -5.0,
         log_var_max = 2.0,
@@ -430,6 +425,8 @@ class Metacontroller(nn.Module):
         self.discovery_mod = discovery_mod
         self.discovery_mod.requires_grad_(False)
         self.discovery_mod.eval()
+
+        discovery_dim = discovery_mod.dim
 
         self.log_var_min = log_var_min
         self.log_var_max = log_var_max
@@ -447,6 +444,11 @@ class Metacontroller(nn.Module):
                 attn_dim_head = decoder_dim_head
             )
         )
+
+        self.teacher_proj = nn.Linear(discovery_dim, dim) if discovery_dim != dim else nn.Identity()
+
+        self.start_high_action_emb = nn.Parameter(torch.randn(dim))
+        self.past_high_action_proj = nn.Linear(dim, dim)
 
         lower_controller_kwargs = default(lower_controller_kwargs, dict())
         self.lower_controller = ConditionedActorCritic(
@@ -519,9 +521,15 @@ class Metacontroller(nn.Module):
             expanded = torch.repeat_interleave(flat_target_high_actions, flat_chunk_lens, dim = 0)
             target_high_actions = rearrange(expanded, '(b n) d -> b n d', b = batch)
 
+        target_high_actions = self.teacher_proj(target_high_actions)
+
         # higher level decoder predicts gaussian params
 
-        pred_high_actions = self.metacontroller(states, mask = mask)
+        start_emb = repeat(self.start_high_action_emb, 'd -> b 1 d', b = batch)
+        past_high_actions = torch.cat((start_emb, target_high_actions[:, :-1]), dim = 1)
+        sum_embeds = self.past_high_action_proj(past_high_actions)
+
+        pred_high_actions = self.metacontroller(states, mask = mask, sum_embeds = sum_embeds)
 
         pred_flat = rearrange(pred_high_actions, 'b n d -> (b n) d')
         target_flat = rearrange(target_high_actions, 'b n d -> (b n) d')
@@ -576,10 +584,21 @@ class Metacontroller(nn.Module):
     ):
         is_caching = exists(cache)
         state_seq = rearrange(state, 'b d -> b 1 d')
+        batch = state.shape[0]
 
-        pred_params, next_cache = self.metacontroller(
+        if is_caching:
+            transformer_cache, last_high_action = cache
+        else:
+            transformer_cache = None
+            last_high_action = repeat(self.start_high_action_emb, 'd -> b d', b = batch)
+
+        last_high_action_seq = rearrange(last_high_action, 'b d -> b 1 d')
+        sum_embeds = self.past_high_action_proj(last_high_action_seq)
+
+        pred_params, next_transformer_cache = self.metacontroller(
             state_seq,
-            cache = cache,
+            cache = transformer_cache,
+            sum_embeds = sum_embeds,
             input_not_include_cache = is_caching,
             return_intermediates = True
         )
@@ -613,6 +632,8 @@ class Metacontroller(nn.Module):
             action = action,
             temperature = temperature
         )
+
+        next_cache = (next_transformer_cache, pred_high_action.detach())
 
         return action, entropy, critic_logits, next_cache
 
@@ -711,6 +732,9 @@ def evaluate_agent(
                 state_tensor = tensor(state, dtype=torch.float32, device=device)
 
                 kwargs = dict(cache = cache) if forward_has_cache else dict()
+                if isinstance(unwrapped_model, Metacontroller):
+                    kwargs['high_temperature'] = high_temperature
+
                 action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs, temperature = temperature)
 
                 a = action.cpu().numpy()
@@ -748,6 +772,9 @@ def evaluate_agent(
                 state_tensor = rearrange(tensor(state, dtype = torch.float32, device = device), 'd -> 1 d')
 
                 kwargs = dict(cache = cache) if forward_has_cache else dict()
+                if isinstance(unwrapped_model, Metacontroller):
+                    kwargs['high_temperature'] = high_temperature
+
                 action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs, temperature = temperature)
 
                 a = action.item()
