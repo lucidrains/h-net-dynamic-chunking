@@ -1046,6 +1046,7 @@ def train_metacontroller(
 
             # train discovery module
 
+            discovery_mod.train()
             pbar_disc = tqdm(range(epochs), desc = 'Training DiscoveryModule')
 
             for ep in pbar_disc:
