@@ -440,11 +440,11 @@ class Metacontroller(nn.Module):
             rotary_pos_emb = False
         )
 
-        self.teacher_proj = nn.Linear(discovery_dim, dim) if discovery_dim != dim else nn.Identity()
+        self.action_emb_proj = nn.Linear(discovery_dim, dim) if discovery_dim != dim else nn.Identity()
 
         self.high_action_readout = Readout(
             dim = dim,
-            num_continuous = dim,
+            num_continuous = discovery_dim,
             continuous_log_var_embed = True,
             continuous_dist_kwargs = dict(log_var_clamp_range = log_var_range)
         )
@@ -460,7 +460,7 @@ class Metacontroller(nn.Module):
         self.lower_controller = ConditionedActorCritic(
             state_dim = state_dim,
             action_dim = action_dim,
-            condition_dim = dim,
+            condition_dim = discovery_dim,
             **lower_controller_kwargs
         )
 
@@ -513,24 +513,22 @@ class Metacontroller(nn.Module):
 
         with torch.no_grad():
             self.discovery_mod.eval()
-            target_high_actions, chunk_lens = self.discovery_mod(states, actions, extract_high_level_actions = True)
+            raw_target_high_actions, chunk_lens = self.discovery_mod(states, actions, extract_high_level_actions = True)
 
-            flat_target_high_actions = rearrange(target_high_actions, 'b c d -> (b c) d')
+            flat_target_high_actions = rearrange(raw_target_high_actions, 'b c d -> (b c) d')
             flat_chunk_lens = rearrange(chunk_lens, 'b c -> (b c)')
 
             expanded = torch.repeat_interleave(flat_target_high_actions, flat_chunk_lens, dim = 0)
-            target_high_actions = rearrange(expanded, '(b n) d -> b n d', b = batch)
-
-        target_high_actions = self.teacher_proj(target_high_actions)
+            raw_target_high_actions = rearrange(expanded, '(b n) d -> b n d', b = batch)
 
         # interleave states and high_actions
 
         state_repr = self.state_proj(states)
-        high_action_repr = target_high_actions
+        action_tokens = self.action_emb_proj(raw_target_high_actions)
 
         interleaved = torch.empty((batch, 2 * seq, self.metacontroller.dim), device = device, dtype = states.dtype)
         interleaved[:, 0::2] = state_repr
-        interleaved[:, 1::2] = high_action_repr
+        interleaved[:, 1::2] = action_tokens
 
         # interleaved mask
 
@@ -543,7 +541,7 @@ class Metacontroller(nn.Module):
         state_features = dec_out[:, 0::2]
         action_features = dec_out[:, 1::2]
 
-        loss_high = self.high_action_readout(state_features, targets = target_high_actions, loss_mask = mask)
+        loss_high = self.high_action_readout(state_features, targets = raw_target_high_actions, loss_mask = mask)
 
         loss_next_state = tensor(0., device = device)
         if seq > 1:
@@ -555,7 +553,7 @@ class Metacontroller(nn.Module):
 
         states_cond, high_cond = self.maybe_cfg_dropout(
             states,
-            target_high_actions.detach(),
+            raw_target_high_actions,
             force_drop_condition = force_drop_condition,
             force_drop_state = force_drop_state
         )
@@ -621,19 +619,20 @@ class Metacontroller(nn.Module):
 
             pred_high_action = dist.sample()
 
-        action_repr = rearrange(pred_high_action.detach(), 'b d -> b 1 d')
+        # project predicted raw action into transformer token space
+        action_token = self.action_emb_proj(rearrange(pred_high_action.detach(), 'b d -> b 1 d'))
+
         _, transformer_cache = self.metacontroller(
-            action_repr,
+            action_token,
             cache = transformer_cache,
             input_not_include_cache = True,
             return_hiddens = True
         )
 
-        # cfg dropout for lower controller
-
+        # cfg dropout for lower controller uses the raw predicted high action
         state_cond, high_cond = self.maybe_cfg_dropout(
             rearrange(state, 'b d -> b 1 d'),
-            action_repr,
+            rearrange(pred_high_action.detach(), 'b d -> b 1 d'),
             force_drop_condition = force_drop_condition,
             force_drop_state = force_drop_state
         )
