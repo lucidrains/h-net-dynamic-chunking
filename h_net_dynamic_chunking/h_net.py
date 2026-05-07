@@ -62,7 +62,13 @@ class HNet(Module):
         super().__init__()
 
         def instantiate(m):
-            return Decoder(**m) if isinstance(m, dict) else m
+            default_decoder_kwarg = dict(prenorm_has_final_norm = False)
+
+            if isinstance(m, dict):
+                m = {**default_decoder_kwarg, **m}
+                return Decoder(**m)
+
+            return m
 
         self.encoder = instantiate(encoder)
         self.network = instantiate(network)

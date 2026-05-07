@@ -151,11 +151,15 @@ class DiscoveryModule(nn.Module):
 
         # decoder sandwich: decoder1 → hnet → decoder2
 
-        self.decoder1 = Decoder(dim = dim, depth = decoder1_depth, heads = heads, attn_dim_head = dim_head, **decoder_kwargs)
+        inner_decoder_kwargs = {**dict(pre_norm_has_final_norm = False), **decoder_kwargs}
+
+        self.decoder1 = Decoder(dim = dim, depth = decoder1_depth, heads = heads, attn_dim_head = dim_head, **inner_decoder_kwargs)
+
+        self.hnet_prenorm = nn.LayerNorm(dim, elementwise_affine = False)
 
         self.hnet = HNet(
             encoder = nn.Identity(),
-            network = Decoder(dim = dim, depth = hnet_depth, heads = heads, attn_dim_head = dim_head, **decoder_kwargs),
+            network = Decoder(dim = dim, depth = hnet_depth, heads = heads, attn_dim_head = dim_head, **inner_decoder_kwargs),
             decoder = nn.Identity(),
             dim = dim,
             **hnet_kwargs
@@ -191,7 +195,7 @@ class DiscoveryModule(nn.Module):
         state_out = dec1_out[:, 0::2]
         action_out = dec1_out[:, 1::2]
 
-        hnet_ret = self.hnet(state_out, return_intermediates = extract_high_level_actions)
+        hnet_ret = self.hnet(self.hnet_prenorm(state_out), return_intermediates = extract_high_level_actions)
         hnet_state_out = hnet_ret.output
         hnet_aux_loss = hnet_ret.loss
 
@@ -283,7 +287,7 @@ class DiscoveryModule(nn.Module):
         )
 
         hnet_ret = self.hnet(
-            dec1_out,
+            self.hnet_prenorm(dec1_out),
             cache = cache_hnet,
             return_hiddens = True,
             return_intermediates = extract_high_level_actions
