@@ -417,6 +417,7 @@ class Metacontroller(nn.Module):
         decoder_dim_head = 32,
         log_var_min = -5.0,
         log_var_max = 2.0,
+        condition_dropout = 0.5,
         lower_controller_kwargs: dict | None = None
     ):
         super().__init__()
@@ -426,6 +427,7 @@ class Metacontroller(nn.Module):
 
         self.log_var_min = log_var_min
         self.log_var_max = log_var_max
+        self.condition_dropout = condition_dropout
 
         self.metacontroller = ContinuousTransformerWrapper(
             dim_in = state_dim,
@@ -475,22 +477,28 @@ class Metacontroller(nn.Module):
         dist = torch.distributions.Normal(mu, sigma)
         loss_hl = -dist.log_prob(target_hl_actions_flat).mean()
 
-        logits = self.lower_controller(states, target_hl_actions.detach())
+        target_hl_actions_cond = target_hl_actions.detach()
+        if self.training and self.condition_dropout > 0.:
+            keep_mask = torch.rand((states.shape[0], 1, 1), device = states.device) > self.condition_dropout
+            target_hl_actions_cond = target_hl_actions_cond * keep_mask
+
+        logits = self.lower_controller(states, target_hl_actions_cond)
         logits = cast_tuple(logits)[0]
 
-        pred_actions = rearrange(logits, 'b n d -> (b n) d')
-        target_actions = rearrange(actions, 'b n -> (b n)').long()
-
         if exists(mask):
-            pred_actions = pred_actions[flat_mask]
-            target_actions = target_actions[flat_mask]
+            logits = rearrange(logits, 'b n d -> (b n) d')[flat_mask]
+            actions_flat = rearrange(actions, 'b n -> (b n)')[flat_mask]
+        else:
+            logits = rearrange(logits, 'b n d -> (b n) d')
+            actions_flat = rearrange(actions, 'b n -> (b n)')
 
-        loss_ll = F.cross_entropy(pred_actions, target_actions)
-        total_loss = loss_hl + loss_ll
+        loss_ll = F.cross_entropy(logits, actions_flat)
+        loss = loss_hl + loss_ll
 
         if return_loss_breakdown:
-            return total_loss, (loss_hl.item(), loss_ll.item())
-        return total_loss
+            return loss, dict(loss_hl = loss_hl.item(), loss_ll = loss_ll.item())
+
+        return loss
 
     def get_action_and_value(self, state, action = None, cache = None, deterministic = False):
         is_caching = exists(cache)
@@ -987,7 +995,7 @@ def train_metacontroller(
 
                     mask = rearrange(torch.arange(states.shape[1], device = device), 'n -> 1 n') < rearrange(lens, 'b -> b 1')
 
-                    loss = metacontroller(states, actions, mask = mask)
+                    loss, breakdown = metacontroller(states, actions, mask = mask, return_loss_breakdown = True)
 
                     meta_optimizer.zero_grad()
                     accelerator.backward(loss)
@@ -998,11 +1006,11 @@ def train_metacontroller(
                     total_loss_sum += loss.item()
                     num_batches += 1
 
+                    if use_wandb:
+                        wandb.log(dict(metacontroller_loss = loss.item(), **breakdown))
+
                 avg_loss = total_loss_sum / max(num_batches, 1)
                 pbar_meta.set_postfix({'Loss': f'{avg_loss:.4f}'})
-
-                if use_wandb:
-                    wandb.log(dict(metacontroller_loss = avg_loss))
 
             unwrapped_mod = accelerator.unwrap_model(metacontroller)
             unwrapped_mod.eval()
