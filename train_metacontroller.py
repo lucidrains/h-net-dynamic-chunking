@@ -21,6 +21,8 @@
 # ]
 # ///
 
+# inspiration from Kobayashi et al. https://arxiv.org/abs/2512.20605
+
 from __future__ import annotations
 
 import os
