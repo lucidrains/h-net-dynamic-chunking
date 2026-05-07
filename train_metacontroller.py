@@ -109,7 +109,7 @@ class DiscoveryModule(nn.Module):
         self,
         state_dim = 8,
         action_dim = 4,
-        dim = 64,
+        dim = 128,
         decoder1_depth = 1,
         hnet_depth = 1,
         decoder2_depth = 1,
@@ -136,7 +136,7 @@ class DiscoveryModule(nn.Module):
         hnet_kwargs = default(hnet_kwargs, dict(heads = 1, target_avg_token_length = 4.))
         loss_weights = default(loss_weights, dict(
             state_to_action = 1.,
-            action_to_state = 1.,
+            action_to_state = 0.1,
             action_to_action = 1.,
             hnet_aux = 0.1
         ))
@@ -371,7 +371,8 @@ def evaluate_agent(
     store_buffer = False,
     buffer_folder = './discovery_buffer',
     render_videos = True,
-    forward_has_cache = False
+    forward_has_cache = False,
+    filter_top_percentile = 0.5
 ):
     shutil.rmtree(video_folder, ignore_errors = True)
 
@@ -407,6 +408,7 @@ def evaluate_agent(
 
     model.eval()
     ep_rewards = []
+    episodes_data = []
     pbar = tqdm(range(num_episodes), desc = 'Evaluating Agent')
 
     for ep in pbar:
@@ -445,12 +447,24 @@ def evaluate_agent(
         pbar.set_postfix({'Avg Reward': f'{avg_reward:.2f}', 'Ep Reward': f'{ep_reward_sum:.2f}'})
 
         if store_buffer:
-            with buffer.one_episode():
-                for t in range(step_count):
-                    buffer.store(state = ep_states[t], action = ep_actions[t])
+            episodes_data.append((ep_states, ep_actions, ep_reward_sum))
 
     avg_reward = np.mean(ep_rewards)
     print(f'\nEvaluation Complete! Average Reward over {num_episodes} episodes: {avg_reward:.2f}')
+
+    if store_buffer:
+        episodes_data.sort(key = lambda x: x[2], reverse = True)
+        top_k = max(1, int(len(episodes_data) * filter_top_percentile))
+        filtered_episodes = episodes_data[:top_k]
+
+        filtered_avg_reward = np.mean([x[2] for x in filtered_episodes])
+        print(f'Storing top {top_k} episodes with average reward: {filtered_avg_reward:.2f}')
+
+        for ep_states, ep_actions, reward in filtered_episodes:
+            with buffer.one_episode():
+                for t in range(len(ep_states)):
+                    buffer.store(state = ep_states[t], action = ep_actions[t])
+
     print(f'Videos saved to: {Path(video_folder).absolute()}')
 
     env.close()
@@ -483,8 +497,10 @@ def train_metacontroller(
     evaluate = False,
     train_discovery = False,
     skip_ppo_eval = False,
+    max_discovery_steps = 1000,
     load_path = './metacontroller_agent.pt',
-    eval_episodes = 20
+    eval_episodes = 20,
+    filter_top_percentile = 0.5
 ):
     if use_wandb:
         run_name = 'behavior_clone_phase' if train_discovery else 'initial_policy_optimization'
@@ -565,8 +581,10 @@ def train_metacontroller(
 
         best_eval_reward = -float('inf')
         loop_count = 0
+        total_steps = 0
+        discovery_target = target_avg_cum_reward + margin_of_error
 
-        while best_eval_reward < -75.0:
+        while best_eval_reward < discovery_target and total_steps < max_discovery_steps:
             loop_count += 1
             print(f'\n--- Discovery Training Loop {loop_count} ---')
 
@@ -581,7 +599,8 @@ def train_metacontroller(
                 seed = seed + loop_count * 1000,
                 store_buffer = True,
                 buffer_folder = './discovery_buffer',
-                render_videos = False
+                render_videos = False,
+                filter_top_percentile = filter_top_percentile
             )
 
             dataloader = buffer.dataloader(batch_size = batch_size, fields = ('state', 'action'))
@@ -596,6 +615,9 @@ def train_metacontroller(
                 num_batches = 0
 
                 for batch in dataloader:
+                    if total_steps >= max_discovery_steps:
+                        break
+
                     states, actions, lens = [batch[k].to(device) for k in ('state', 'action', '_lens')]
 
                     # build mask from episode lengths
@@ -610,6 +632,7 @@ def train_metacontroller(
                     accelerator.backward(loss)
                     nn.utils.clip_grad_norm_(discovery_mod.parameters(), 0.5)
                     disc_optimizer.step()
+                    total_steps += 1
 
                     total_loss_sum += loss.item()
                     num_batches += 1
@@ -621,9 +644,6 @@ def train_metacontroller(
                 pbar_disc.set_postfix({'Loss': f'{avg_loss:.4f}'})
 
             unwrapped_mod = accelerator.unwrap_model(discovery_mod)
-
-            torch.save(unwrapped_mod.state_dict(), 'discovery.pt')
-            print('Saved discovery.pt!')
 
             # evaluate discovery policy
 
@@ -656,8 +676,11 @@ def train_metacontroller(
                 best_eval_reward = eval_reward
                 print(f'New best eval reward: {best_eval_reward:.2f}')
 
-            if best_eval_reward >= -75.0:
-                print(f'DiscoveryModule reached target reward >= -75.0! (best: {best_eval_reward:.2f})')
+                torch.save(unwrapped_mod.state_dict(), 'discovery.pt')
+                print('Saved new best discovery.pt!')
+
+            if best_eval_reward >= discovery_target:
+                print(f'DiscoveryModule reached target reward >= {discovery_target:.2f}! (best: {best_eval_reward:.2f})')
                 break
             else:
                 print('Behavior cloning target not yet met. Re-gathering data and continuing training...')
