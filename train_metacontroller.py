@@ -92,15 +92,15 @@ class ActorCritic(nn.Module):
 
         self.critic_mlp = MLP(state_dim, 64, 64, 256)
 
-    def get_action_and_value(self, state, action = None):
+    def get_action_and_value(self, state, action = None, temperature = 1.):
         actor_features = self.actor_mlp(state)
         logits = self.actor_readout(actor_features)
         logits = cast_tuple(logits)[0]
 
-        probs = torch.distributions.Categorical(logits = logits)
-
         if not exists(action):
-            action = probs.sample()
+            action = self.actor_readout.sample(logits, temperature = temperature)
+
+        probs = torch.distributions.Categorical(logits = logits)
 
         critic_logits = self.critic_mlp(state)
         value = self.hl_gauss_loss(critic_logits)
@@ -276,7 +276,7 @@ class DiscoveryModule(nn.Module):
         )
 
     @torch.no_grad()
-    def get_action_and_value(self, state, action = None, cache = None, extract_high_level_actions = False):
+    def get_action_and_value(self, state, action = None, cache = None, extract_high_level_actions = False, temperature = 1.):
         cache_dec1, cache_hnet, cache_dec2 = default(cache, (None, None, None))
         is_caching = exists(cache)
 
@@ -316,10 +316,11 @@ class DiscoveryModule(nn.Module):
         # readout action from state position
 
         action_logits = self.state_readout(rearrange(dec2_out, 'b 1 d -> b d'))
-        probs = torch.distributions.Categorical(logits = action_logits)
 
         if not exists(action):
-            action = probs.sample()
+            action = self.state_readout.sample(action_logits, temperature = temperature)
+
+        probs = torch.distributions.Categorical(logits = action_logits)
 
         # process action through decoder1 → decoder2 (skip hnet for action positions)
 
@@ -388,14 +389,14 @@ class ConditionedActorCritic(nn.Module):
         features = self.actor_mlp(features)
         return self.actor_readout(features)
 
-    def get_action_and_value(self, state, condition, action = None):
+    def get_action_and_value(self, state, condition, action = None, temperature = 1.):
         logits = self.forward(state, condition)
         logits = cast_tuple(logits)[0]
 
-        probs = torch.distributions.Categorical(logits = logits)
-
         if not exists(action):
-            action = probs.sample()
+            action = self.actor_readout.sample(logits, temperature = temperature)
+
+        probs = torch.distributions.Categorical(logits = logits)
 
         critic_features = F.silu(self.critic_state_proj(state) + self.critic_cond_proj(condition))
         critic_logits = self.critic_mlp(critic_features)
@@ -455,7 +456,7 @@ class Metacontroller(nn.Module):
             **lower_controller_kwargs
         )
 
-    def decode_hl_action_params(self, params):
+    def decode_high_action_params(self, params):
         mu, log_var = params.chunk(2, dim = -1)
         log_var = log_var.clamp(min = self.log_var_min, max = self.log_var_max)
         sigma = torch.exp(0.5 * log_var)
@@ -464,7 +465,7 @@ class Metacontroller(nn.Module):
     def maybe_cfg_dropout(
         self,
         states,
-        hl_actions,
+        high_actions,
         force_drop_condition = False,
         force_drop_state = False
     ):
@@ -473,16 +474,16 @@ class Metacontroller(nn.Module):
         assert not (force_drop_condition and force_drop_state), 'cannot drop both condition and state'
 
         if force_drop_condition:
-            return states, torch.zeros_like(hl_actions)
+            return states, torch.zeros_like(high_actions)
 
         if force_drop_state:
-            return torch.zeros_like(states), hl_actions
+            return torch.zeros_like(states), high_actions
 
         if not self.training:
-            return states, hl_actions
+            return states, high_actions
 
         if self.condition_dropout <= 0. and self.state_dropout <= 0.:
-            return states, hl_actions
+            return states, high_actions
 
         batch, device = states.shape[0], states.device
         rand = torch.rand((batch, 1, 1), device = device)
@@ -490,10 +491,10 @@ class Metacontroller(nn.Module):
         drop_cond = rand < self.condition_dropout
         drop_state = (rand >= self.condition_dropout) & (rand < (self.condition_dropout + self.state_dropout))
 
-        hl_actions = torch.where(drop_cond, 0., hl_actions)
+        high_actions = torch.where(drop_cond, 0., high_actions)
         states = torch.where(drop_state, 0., states)
 
-        return states, hl_actions
+        return states, high_actions
 
     def forward(
         self,
@@ -510,39 +511,39 @@ class Metacontroller(nn.Module):
 
         with torch.no_grad():
             self.discovery_mod.eval()
-            target_hl_actions, chunk_lens = self.discovery_mod(states, actions, extract_high_level_actions = True)
+            target_high_actions, chunk_lens = self.discovery_mod(states, actions, extract_high_level_actions = True)
 
-            flat_target_hl_actions = rearrange(target_hl_actions, 'b c d -> (b c) d')
+            flat_target_high_actions = rearrange(target_high_actions, 'b c d -> (b c) d')
             flat_chunk_lens = rearrange(chunk_lens, 'b c -> (b c)')
 
-            expanded = torch.repeat_interleave(flat_target_hl_actions, flat_chunk_lens, dim = 0)
-            target_hl_actions = rearrange(expanded, '(b n) d -> b n d', b = batch)
+            expanded = torch.repeat_interleave(flat_target_high_actions, flat_chunk_lens, dim = 0)
+            target_high_actions = rearrange(expanded, '(b n) d -> b n d', b = batch)
 
         # higher level decoder predicts gaussian params
 
-        pred_hl_actions = self.metacontroller(states, mask = mask)
+        pred_high_actions = self.metacontroller(states, mask = mask)
 
-        pred_flat = rearrange(pred_hl_actions, 'b n d -> (b n) d')
-        target_flat = rearrange(target_hl_actions, 'b n d -> (b n) d')
+        pred_flat = rearrange(pred_high_actions, 'b n d -> (b n) d')
+        target_flat = rearrange(target_high_actions, 'b n d -> (b n) d')
 
         if exists(mask):
             flat_mask = rearrange(mask, 'b n -> (b n)')
             pred_flat = pred_flat[flat_mask]
             target_flat = target_flat[flat_mask]
 
-        mu, sigma = self.decode_hl_action_params(pred_flat)
-        loss_hl = -torch.distributions.Normal(mu, sigma).log_prob(target_flat).mean()
+        mu, sigma = self.decode_high_action_params(pred_flat)
+        loss_high = -torch.distributions.Normal(mu, sigma).log_prob(target_flat).mean()
 
         # cfg dropout + lower controller loss
 
-        states_cond, hl_cond = self.maybe_cfg_dropout(
+        states_cond, high_cond = self.maybe_cfg_dropout(
             states,
-            target_hl_actions.detach(),
+            target_high_actions.detach(),
             force_drop_condition = force_drop_condition,
             force_drop_state = force_drop_state
         )
 
-        logits = self.lower_controller(states_cond, hl_cond)
+        logits = self.lower_controller(states_cond, high_cond)
         logits = cast_tuple(logits)[0]
 
         logits = rearrange(logits, 'b n d -> (b n) d')
@@ -552,23 +553,24 @@ class Metacontroller(nn.Module):
             logits = logits[flat_mask]
             actions_flat = actions_flat[flat_mask]
 
-        loss_ll = F.cross_entropy(logits, actions_flat)
+        loss_low = F.cross_entropy(logits, actions_flat)
 
         # combine
 
-        loss = loss_hl + loss_ll
+        loss = loss_high + loss_low
 
         if not return_loss_breakdown:
             return loss
 
-        return loss, dict(loss_hl = loss_hl.item(), loss_ll = loss_ll.item())
+        return loss, dict(loss_high = loss_high.item(), loss_low = loss_low.item())
 
     def get_action_and_value(
         self,
         state,
         action = None,
         cache = None,
-        deterministic = False,
+        temperature = 1.,
+        high_temperature = 1.,
         force_drop_condition = False,
         force_drop_state = False
     ):
@@ -583,29 +585,33 @@ class Metacontroller(nn.Module):
         )
 
         pred_params = rearrange(pred_params, 'b 1 d -> b d')
-        mu, sigma = self.decode_hl_action_params(pred_params)
+        mu, sigma = self.decode_high_action_params(pred_params)
 
-        if deterministic:
-            pred_hl_action = mu
+        if high_temperature > 0. and high_temperature != 1.:
+            sigma = sigma * high_temperature
+
+        if high_temperature == 0.:
+            pred_high_action = mu
         else:
-            pred_hl_action = torch.distributions.Normal(mu, sigma).sample()
+            pred_high_action = torch.distributions.Normal(mu, sigma).sample()
 
         # cfg dropout for lower controller
 
-        state_cond, hl_cond = self.maybe_cfg_dropout(
+        state_cond, high_cond = self.maybe_cfg_dropout(
             rearrange(state, 'b d -> b 1 d'),
-            rearrange(pred_hl_action.detach(), 'b d -> b 1 d'),
+            rearrange(pred_high_action.detach(), 'b d -> b 1 d'),
             force_drop_condition = force_drop_condition,
             force_drop_state = force_drop_state
         )
 
         state_cond = rearrange(state_cond, 'b 1 d -> b d')
-        hl_cond = rearrange(hl_cond, 'b 1 d -> b d')
+        high_cond = rearrange(high_cond, 'b 1 d -> b d')
 
         action, _, entropy, _, critic_logits = self.lower_controller.get_action_and_value(
             state_cond,
-            hl_cond,
-            action = action
+            high_cond,
+            action = action,
+            temperature = temperature
         )
 
         return action, entropy, critic_logits, next_cache
@@ -650,7 +656,9 @@ def evaluate_agent(
     forward_has_cache = False,
     filter_top_percentile = 0.5,
     quiet = False,
-    vectorization_mode = None
+    vectorization_mode = None,
+    temperature = 1.,
+    high_temperature = 1.
 ):
     shutil.rmtree(video_folder, ignore_errors = True)
 
@@ -703,7 +711,7 @@ def evaluate_agent(
                 state_tensor = tensor(state, dtype=torch.float32, device=device)
 
                 kwargs = dict(cache = cache) if forward_has_cache else dict()
-                action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs)
+                action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs, temperature = temperature)
 
                 a = action.cpu().numpy()
                 next_state, reward, terminated, truncated, _ = env.step(a)
@@ -740,7 +748,7 @@ def evaluate_agent(
                 state_tensor = rearrange(tensor(state, dtype = torch.float32, device = device), 'd -> 1 d')
 
                 kwargs = dict(cache = cache) if forward_has_cache else dict()
-                action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs)
+                action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs, temperature = temperature)
 
                 a = action.item()
                 ep_actions.append(a)
