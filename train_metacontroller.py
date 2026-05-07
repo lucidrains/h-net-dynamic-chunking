@@ -55,6 +55,7 @@ from x_mlps_pytorch import MLP
 from hl_gauss_pytorch import HLGaussLoss
 from discrete_continuous_embed_readout import Readout
 from memmap_replay_buffer import ReplayBuffer
+from torch_einops_utils.save_load import save_load
 from assoc_scan import AssocScan
 from x_transformers import Decoder, ContinuousTransformerWrapper
 from h_net_dynamic_chunking.h_net import HNet
@@ -404,6 +405,7 @@ class ConditionedActorCritic(nn.Module):
 
 # unified metacontroller
 
+@save_load
 class Metacontroller(nn.Module):
     def __init__(
         self,
@@ -418,9 +420,12 @@ class Metacontroller(nn.Module):
         log_var_min = -5.0,
         log_var_max = 2.0,
         condition_dropout = 0.5,
+        state_dropout = 0.2,
         lower_controller_kwargs: dict | None = None
     ):
         super().__init__()
+        assert (condition_dropout + state_dropout) <= 1., 'condition and state dropout must sum to at most 1'
+
         self.discovery_mod = discovery_mod
         self.discovery_mod.requires_grad_(False)
         self.discovery_mod.eval()
@@ -428,6 +433,7 @@ class Metacontroller(nn.Module):
         self.log_var_min = log_var_min
         self.log_var_max = log_var_max
         self.condition_dropout = condition_dropout
+        self.state_dropout = state_dropout
 
         self.metacontroller = ContinuousTransformerWrapper(
             dim_in = state_dim,
@@ -449,7 +455,59 @@ class Metacontroller(nn.Module):
             **lower_controller_kwargs
         )
 
-    def forward(self, states, actions, mask = None, return_loss_breakdown = False):
+    def decode_hl_action_params(self, params):
+        mu, log_var = params.chunk(2, dim = -1)
+        log_var = log_var.clamp(min = self.log_var_min, max = self.log_var_max)
+        sigma = torch.exp(0.5 * log_var)
+        return mu, sigma
+
+    def maybe_cfg_dropout(
+        self,
+        states,
+        hl_actions,
+        force_drop_condition = False,
+        force_drop_state = False
+    ):
+        """ mutually exclusive dropout on condition or state for classifier free guidance """
+
+        assert not (force_drop_condition and force_drop_state), 'cannot drop both condition and state'
+
+        if force_drop_condition:
+            return states, torch.zeros_like(hl_actions)
+
+        if force_drop_state:
+            return torch.zeros_like(states), hl_actions
+
+        if not self.training:
+            return states, hl_actions
+
+        if self.condition_dropout <= 0. and self.state_dropout <= 0.:
+            return states, hl_actions
+
+        batch, device = states.shape[0], states.device
+        rand = torch.rand((batch, 1, 1), device = device)
+
+        drop_cond = rand < self.condition_dropout
+        drop_state = (rand >= self.condition_dropout) & (rand < (self.condition_dropout + self.state_dropout))
+
+        hl_actions = torch.where(drop_cond, 0., hl_actions)
+        states = torch.where(drop_state, 0., states)
+
+        return states, hl_actions
+
+    def forward(
+        self,
+        states,
+        actions,
+        mask = None,
+        return_loss_breakdown = False,
+        force_drop_condition = False,
+        force_drop_state = False
+    ):
+        batch, seq, device = *states.shape[:2], states.device
+
+        # extract teacher higher level actions
+
         with torch.no_grad():
             self.discovery_mod.eval()
             target_hl_actions, chunk_lens = self.discovery_mod(states, actions, extract_high_level_actions = True)
@@ -457,77 +515,98 @@ class Metacontroller(nn.Module):
             flat_target_hl_actions = rearrange(target_hl_actions, 'b c d -> (b c) d')
             flat_chunk_lens = rearrange(chunk_lens, 'b c -> (b c)')
 
-            expanded_flat_targets = torch.repeat_interleave(flat_target_hl_actions, flat_chunk_lens, dim = 0)
-            target_hl_actions = rearrange(expanded_flat_targets, '(b n) d -> b n d', b = states.shape[0])
+            expanded = torch.repeat_interleave(flat_target_hl_actions, flat_chunk_lens, dim = 0)
+            target_hl_actions = rearrange(expanded, '(b n) d -> b n d', b = batch)
+
+        # higher level decoder predicts gaussian params
 
         pred_hl_actions = self.metacontroller(states, mask = mask)
 
+        pred_flat = rearrange(pred_hl_actions, 'b n d -> (b n) d')
+        target_flat = rearrange(target_hl_actions, 'b n d -> (b n) d')
+
         if exists(mask):
             flat_mask = rearrange(mask, 'b n -> (b n)')
-            pred_hl_actions_flat = rearrange(pred_hl_actions, 'b n d -> (b n) d')[flat_mask]
-            target_hl_actions_flat = rearrange(target_hl_actions, 'b n d -> (b n) d')[flat_mask]
-        else:
-            pred_hl_actions_flat = rearrange(pred_hl_actions, 'b n d -> (b n) d')
-            target_hl_actions_flat = rearrange(target_hl_actions, 'b n d -> (b n) d')
+            pred_flat = pred_flat[flat_mask]
+            target_flat = target_flat[flat_mask]
 
-        mu, log_var = pred_hl_actions_flat.chunk(2, dim = -1)
-        log_var = log_var.clamp(min = self.log_var_min, max = self.log_var_max)
-        sigma = torch.exp(0.5 * log_var)
+        mu, sigma = self.decode_hl_action_params(pred_flat)
+        loss_hl = -torch.distributions.Normal(mu, sigma).log_prob(target_flat).mean()
 
-        dist = torch.distributions.Normal(mu, sigma)
-        loss_hl = -dist.log_prob(target_hl_actions_flat).mean()
+        # cfg dropout + lower controller loss
 
-        target_hl_actions_cond = target_hl_actions.detach()
-        if self.training and self.condition_dropout > 0.:
-            keep_mask = torch.rand((states.shape[0], 1, 1), device = states.device) > self.condition_dropout
-            target_hl_actions_cond = target_hl_actions_cond * keep_mask
+        states_cond, hl_cond = self.maybe_cfg_dropout(
+            states,
+            target_hl_actions.detach(),
+            force_drop_condition = force_drop_condition,
+            force_drop_state = force_drop_state
+        )
 
-        logits = self.lower_controller(states, target_hl_actions_cond)
+        logits = self.lower_controller(states_cond, hl_cond)
         logits = cast_tuple(logits)[0]
 
+        logits = rearrange(logits, 'b n d -> (b n) d')
+        actions_flat = rearrange(actions, 'b n -> (b n)')
+
         if exists(mask):
-            logits = rearrange(logits, 'b n d -> (b n) d')[flat_mask]
-            actions_flat = rearrange(actions, 'b n -> (b n)')[flat_mask]
-        else:
-            logits = rearrange(logits, 'b n d -> (b n) d')
-            actions_flat = rearrange(actions, 'b n -> (b n)')
+            logits = logits[flat_mask]
+            actions_flat = actions_flat[flat_mask]
 
         loss_ll = F.cross_entropy(logits, actions_flat)
+
+        # combine
+
         loss = loss_hl + loss_ll
 
-        if return_loss_breakdown:
-            return loss, dict(loss_hl = loss_hl.item(), loss_ll = loss_ll.item())
+        if not return_loss_breakdown:
+            return loss
 
-        return loss
+        return loss, dict(loss_hl = loss_hl.item(), loss_ll = loss_ll.item())
 
-    def get_action_and_value(self, state, action = None, cache = None, deterministic = False):
+    def get_action_and_value(
+        self,
+        state,
+        action = None,
+        cache = None,
+        deterministic = False,
+        force_drop_condition = False,
+        force_drop_state = False
+    ):
         is_caching = exists(cache)
         state_seq = rearrange(state, 'b d -> b 1 d')
 
-        pred_hl_action_params, intermediates = self.metacontroller(
+        pred_params, next_cache = self.metacontroller(
             state_seq,
             cache = cache,
             input_not_include_cache = is_caching,
             return_intermediates = True
         )
-        # the continuous wrapper returns out, layer_intermediates when return_intermediates=True
-        next_cache = intermediates
 
-        # strip sequence dim
-        state = rearrange(state_seq, 'b 1 d -> b d')
-        pred_hl_action_params = rearrange(pred_hl_action_params, 'b 1 d -> b d')
-
-        mu, log_var = pred_hl_action_params.chunk(2, dim = -1)
-        log_var = log_var.clamp(min = self.log_var_min, max = self.log_var_max)
-        sigma = torch.exp(0.5 * log_var)
+        pred_params = rearrange(pred_params, 'b 1 d -> b d')
+        mu, sigma = self.decode_hl_action_params(pred_params)
 
         if deterministic:
             pred_hl_action = mu
         else:
-            dist = torch.distributions.Normal(mu, sigma)
-            pred_hl_action = dist.sample()
+            pred_hl_action = torch.distributions.Normal(mu, sigma).sample()
 
-        action, log_prob, entropy, value, critic_logits = self.lower_controller.get_action_and_value(state, pred_hl_action.detach(), action = action)
+        # cfg dropout for lower controller
+
+        state_cond, hl_cond = self.maybe_cfg_dropout(
+            rearrange(state, 'b d -> b 1 d'),
+            rearrange(pred_hl_action.detach(), 'b d -> b 1 d'),
+            force_drop_condition = force_drop_condition,
+            force_drop_state = force_drop_state
+        )
+
+        state_cond = rearrange(state_cond, 'b 1 d -> b d')
+        hl_cond = rearrange(hl_cond, 'b 1 d -> b d')
+
+        action, _, entropy, _, critic_logits = self.lower_controller.get_action_and_value(
+            state_cond,
+            hl_cond,
+            action = action
+        )
 
         return action, entropy, critic_logits, next_cache
 
@@ -1034,7 +1113,7 @@ def train_metacontroller(
             if eval_reward > best_eval_reward:
                 best_eval_reward = eval_reward
                 print(f'New best Metacontroller reward: {best_eval_reward:.2f}')
-                torch.save(unwrapped_mod.state_dict(), 'metacontroller_joint.pt')
+                unwrapped_mod.save('metacontroller_joint.pt')
 
             if best_eval_reward >= metacontroller_target:
                 print('Metacontroller convergence target reached!')
