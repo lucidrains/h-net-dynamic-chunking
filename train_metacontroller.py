@@ -57,7 +57,7 @@ from discrete_continuous_embed_readout import Readout
 from memmap_replay_buffer import ReplayBuffer
 from torch_einops_utils.save_load import save_load
 from assoc_scan import AssocScan
-from x_transformers import Decoder, ContinuousTransformerWrapper
+from x_transformers import Decoder
 from h_net_dynamic_chunking.h_net import HNet
 
 # helpers
@@ -409,12 +409,10 @@ class Metacontroller(nn.Module):
         state_dim = 8,
         action_dim = 4,
         dim = 96,
-        max_seq_len = 1000,
         decoder_depth = 4,
         decoder_heads = 8,
         decoder_dim_head = 32,
-        log_var_min = -5.0,
-        log_var_max = 2.0,
+        log_var_range = (-5., 2.),
         condition_dropout = 0.5,
         state_dropout = 0.2,
         lower_controller_kwargs: dict | None = None
@@ -428,27 +426,35 @@ class Metacontroller(nn.Module):
 
         discovery_dim = discovery_mod.dim
 
-        self.log_var_min = log_var_min
-        self.log_var_max = log_var_max
         self.condition_dropout = condition_dropout
         self.state_dropout = state_dropout
 
-        self.metacontroller = ContinuousTransformerWrapper(
-            dim_in = state_dim,
-            dim_out = dim * 2,
-            max_seq_len = max_seq_len,
-            attn_layers = Decoder(
-                dim = dim,
-                depth = decoder_depth,
-                heads = decoder_heads,
-                attn_dim_head = decoder_dim_head
-            )
+        self.state_proj = nn.Linear(state_dim, dim)
+
+        self.metacontroller = Decoder(
+            dim = dim,
+            depth = decoder_depth,
+            heads = decoder_heads,
+            attn_dim_head = decoder_dim_head,
+            polar_pos_emb = True,
+            rotary_pos_emb = False
         )
 
         self.teacher_proj = nn.Linear(discovery_dim, dim) if discovery_dim != dim else nn.Identity()
 
-        self.start_high_action_emb = nn.Parameter(torch.randn(dim))
-        self.past_high_action_proj = nn.Linear(dim, dim)
+        self.high_action_readout = Readout(
+            dim = dim,
+            num_continuous = dim,
+            continuous_log_var_embed = True,
+            continuous_dist_kwargs = dict(log_var_clamp_range = log_var_range)
+        )
+
+        self.state_readout = Readout(
+            dim = dim,
+            num_continuous = state_dim,
+            continuous_log_var_embed = False,
+            regression_loss_type = 'mse'
+        )
 
         lower_controller_kwargs = default(lower_controller_kwargs, dict())
         self.lower_controller = ConditionedActorCritic(
@@ -457,12 +463,6 @@ class Metacontroller(nn.Module):
             condition_dim = dim,
             **lower_controller_kwargs
         )
-
-    def decode_high_action_params(self, params):
-        mu, log_var = params.chunk(2, dim = -1)
-        log_var = log_var.clamp(min = self.log_var_min, max = self.log_var_max)
-        sigma = torch.exp(0.5 * log_var)
-        return mu, sigma
 
     def maybe_cfg_dropout(
         self,
@@ -523,24 +523,33 @@ class Metacontroller(nn.Module):
 
         target_high_actions = self.teacher_proj(target_high_actions)
 
-        # higher level decoder predicts gaussian params
+        # interleave states and high_actions
 
-        start_emb = repeat(self.start_high_action_emb, 'd -> b 1 d', b = batch)
-        past_high_actions = torch.cat((start_emb, target_high_actions[:, :-1]), dim = 1)
-        sum_embeds = self.past_high_action_proj(past_high_actions)
+        state_repr = self.state_proj(states)
+        high_action_repr = target_high_actions
 
-        pred_high_actions = self.metacontroller(states, mask = mask, sum_embeds = sum_embeds)
+        interleaved = torch.empty((batch, 2 * seq, self.metacontroller.dim), device = device, dtype = states.dtype)
+        interleaved[:, 0::2] = state_repr
+        interleaved[:, 1::2] = high_action_repr
 
-        pred_flat = rearrange(pred_high_actions, 'b n d -> (b n) d')
-        target_flat = rearrange(target_high_actions, 'b n d -> (b n) d')
+        # interleaved mask
 
+        interleaved_mask = None
         if exists(mask):
-            flat_mask = rearrange(mask, 'b n -> (b n)')
-            pred_flat = pred_flat[flat_mask]
-            target_flat = target_flat[flat_mask]
+            interleaved_mask = repeat(mask, 'b n -> b (n 2)')
 
-        mu, sigma = self.decode_high_action_params(pred_flat)
-        loss_high = -torch.distributions.Normal(mu, sigma).log_prob(target_flat).mean()
+        dec_out = self.metacontroller(interleaved, mask = interleaved_mask)
+
+        state_features = dec_out[:, 0::2]
+        action_features = dec_out[:, 1::2]
+
+        loss_high = self.high_action_readout(state_features, targets = target_high_actions, loss_mask = mask)
+
+        loss_next_state = tensor(0., device = device)
+        if seq > 1:
+            next_states = states[:, 1:]
+            shifted_mask = mask[:, :-1] & mask[:, 1:] if exists(mask) else None
+            loss_next_state = self.state_readout(action_features[:, :-1], targets = next_states, loss_mask = shifted_mask)
 
         # cfg dropout + lower controller loss
 
@@ -558,6 +567,7 @@ class Metacontroller(nn.Module):
         actions_flat = rearrange(actions, 'b n -> (b n)')
 
         if exists(mask):
+            flat_mask = rearrange(mask, 'b n -> (b n)')
             logits = logits[flat_mask]
             actions_flat = actions_flat[flat_mask]
 
@@ -565,12 +575,12 @@ class Metacontroller(nn.Module):
 
         # combine
 
-        loss = loss_high + loss_low
+        loss = loss_high + loss_next_state + loss_low
 
         if not return_loss_breakdown:
             return loss
 
-        return loss, dict(loss_high = loss_high.item(), loss_low = loss_low.item())
+        return loss, dict(loss_high = loss_high.item(), loss_next_state = loss_next_state.item(), loss_low = loss_low.item())
 
     def get_action_and_value(
         self,
@@ -584,41 +594,46 @@ class Metacontroller(nn.Module):
     ):
         is_caching = exists(cache)
         state_seq = rearrange(state, 'b d -> b 1 d')
-        batch = state.shape[0]
 
         if is_caching:
             transformer_cache, last_high_action = cache
         else:
             transformer_cache = None
-            last_high_action = repeat(self.start_high_action_emb, 'd -> b d', b = batch)
+            last_high_action = None
 
-        last_high_action_seq = rearrange(last_high_action, 'b d -> b 1 d')
-        sum_embeds = self.past_high_action_proj(last_high_action_seq)
+        state_repr = self.state_proj(state_seq)
 
-        pred_params, next_transformer_cache = self.metacontroller(
-            state_seq,
+        dec_out, transformer_cache = self.metacontroller(
+            state_repr,
             cache = transformer_cache,
-            sum_embeds = sum_embeds,
             input_not_include_cache = is_caching,
-            return_intermediates = True
+            return_hiddens = True
         )
 
-        pred_params = rearrange(pred_params, 'b 1 d -> b d')
-        mu, sigma = self.decode_high_action_params(pred_params)
-
-        if high_temperature > 0. and high_temperature != 1.:
-            sigma = sigma * high_temperature
+        continuous_params = self.high_action_readout(rearrange(dec_out, 'b 1 d -> b d'))
+        dist = self.high_action_readout.continuous_dist.dist(continuous_params)
 
         if high_temperature == 0.:
-            pred_high_action = mu
+            pred_high_action = dist.mean
         else:
-            pred_high_action = torch.distributions.Normal(mu, sigma).sample()
+            if high_temperature > 0. and high_temperature != 1.:
+                dist = torch.distributions.Normal(dist.mean, dist.stddev * high_temperature)
+
+            pred_high_action = dist.sample()
+
+        action_repr = rearrange(pred_high_action.detach(), 'b d -> b 1 d')
+        _, transformer_cache = self.metacontroller(
+            action_repr,
+            cache = transformer_cache,
+            input_not_include_cache = True,
+            return_hiddens = True
+        )
 
         # cfg dropout for lower controller
 
         state_cond, high_cond = self.maybe_cfg_dropout(
             rearrange(state, 'b d -> b 1 d'),
-            rearrange(pred_high_action.detach(), 'b d -> b 1 d'),
+            action_repr,
             force_drop_condition = force_drop_condition,
             force_drop_state = force_drop_state
         )
@@ -633,7 +648,7 @@ class Metacontroller(nn.Module):
             temperature = temperature
         )
 
-        next_cache = (next_transformer_cache, pred_high_action.detach())
+        next_cache = (transformer_cache, pred_high_action.detach())
 
         return action, entropy, critic_logits, next_cache
 
@@ -679,7 +694,8 @@ def evaluate_agent(
     quiet = False,
     vectorization_mode = None,
     temperature = 1.,
-    high_temperature = 1.
+    high_temperature = 1.,
+    max_timesteps = 1000
 ):
     shutil.rmtree(video_folder, ignore_errors = True)
 
@@ -706,7 +722,7 @@ def evaluate_agent(
         buffer = ReplayBuffer(
             folder = buffer_folder,
             max_episodes = num_episodes,
-            max_timesteps = 1000,
+            max_timesteps = max_timesteps,
             fields = dict(
                 state = ('float', (8,)),
                 action = ('int', ())
@@ -728,7 +744,7 @@ def evaluate_agent(
 
         cache = None
         with torch.no_grad():
-            while not done.all() and step_count < 1000:
+            while not done.all() and step_count < max_timesteps:
                 state_tensor = tensor(state, dtype=torch.float32, device=device)
 
                 kwargs = dict(cache = cache) if forward_has_cache else dict()
@@ -767,7 +783,7 @@ def evaluate_agent(
         cache = None
 
         with torch.no_grad():
-            while not done and step_count < 1000:
+            while not done and step_count < max_timesteps:
                 ep_states.append(state)
                 state_tensor = rearrange(tensor(state, dtype = torch.float32, device = device), 'd -> 1 d')
 
@@ -852,6 +868,7 @@ def train_metacontroller(
     skip_ppo_eval = False,
     skip_discovery_eval = False,
     max_discovery_steps = 1000,
+    max_timesteps = 1000,
     load_path = './metacontroller_agent.pt',
     eval_episodes = 20,
     filter_top_percentile = 0.5
@@ -1075,19 +1092,24 @@ def train_metacontroller(
             print(f'\n--- Joint Metacontroller Training Loop {loop_count} ---')
 
             # gather expert trajectories
-            _, buffer = evaluate_agent(
-                model = discovery_mod,
-                num_episodes = eval_episodes,
-                video_folder = 'joint_gather_videos',
-                record_every = 0,
-                device = device,
-                seed = seed + loop_count * 1000,
-                store_buffer = True,
-                buffer_folder = './joint_metacontroller_buffer',
-                render_videos = False,
-                filter_top_percentile = filter_top_percentile,
-                forward_has_cache = True
-            )
+            if skip_discovery_eval and loop_count == 1:
+                print("Skipping discovery eval and loading buffer...")
+                buffer = ReplayBuffer.from_folder('./joint_metacontroller_buffer')
+            else:
+                _, buffer = evaluate_agent(
+                    model = discovery_mod,
+                    num_episodes = eval_episodes,
+                    video_folder = 'joint_gather_videos',
+                    record_every = 0,
+                    device = device,
+                    seed = seed + loop_count * 1000,
+                    store_buffer = True,
+                    buffer_folder = './joint_metacontroller_buffer',
+                    render_videos = False,
+                    filter_top_percentile = filter_top_percentile,
+                    forward_has_cache = True,
+                    max_timesteps = max_timesteps
+                )
 
             dataloader = buffer.dataloader(batch_size = batch_size, fields = ('state', 'action'))
             dataloader = accelerator.prepare(dataloader)
