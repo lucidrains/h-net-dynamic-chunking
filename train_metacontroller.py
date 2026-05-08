@@ -53,7 +53,7 @@ from x_evolution import EvoStrategy
 
 from x_mlps_pytorch import MLP
 from hl_gauss_pytorch import HLGaussLoss
-from discrete_continuous_embed_readout import Readout
+from discrete_continuous_embed_readout import Readout, Embed
 from memmap_replay_buffer import ReplayBuffer
 from torch_einops_utils.save_load import save_load
 from torch_einops_utils import lens_to_mask
@@ -481,6 +481,7 @@ class Metacontroller(nn.Module):
         log_var_range = (-5., 2.),
         condition_dropout = 0.5,
         state_dropout = 0.2,
+        condition_on_past_actions = False,
         lower_controller_kwargs: dict | None = None
     ):
         super().__init__()
@@ -494,6 +495,11 @@ class Metacontroller(nn.Module):
 
         self.condition_dropout = condition_dropout
         self.state_dropout = state_dropout
+
+        self.condition_on_past_actions = condition_on_past_actions
+        if condition_on_past_actions:
+            self.fine_action_emb = Embed(dim = dim, num_discrete = action_dim)
+            self.fine_action_start_token = nn.Parameter(torch.randn(dim))
 
         self.state_proj = nn.Linear(state_dim, dim)
 
@@ -604,6 +610,13 @@ class Metacontroller(nn.Module):
         # interleave states and high_actions
 
         state_repr = self.state_proj(states)
+
+        if self.condition_on_past_actions:
+            fine_action_tokens = self.fine_action_emb(actions)
+            start_token = repeat(self.fine_action_start_token, 'd -> b 1 d', b = batch)
+            past_action_tokens = torch.cat((start_token, fine_action_tokens[:, :-1]), dim = 1)
+            state_repr = state_repr + past_action_tokens
+
         action_tokens = self.action_emb_proj(raw_target_high_actions)
 
         interleaved = torch.empty((batch, 2 * seq, self.metacontroller.dim), device = device, dtype = states.dtype)
@@ -678,12 +691,21 @@ class Metacontroller(nn.Module):
         state_seq = rearrange(state, 'b d -> b 1 d')
 
         if is_caching:
-            transformer_cache, last_high_action = cache
+            transformer_cache, last_high_action, last_fine_action = cache
         else:
             transformer_cache = None
             last_high_action = None
+            last_fine_action = None
 
         state_repr = self.state_proj(state_seq)
+
+        if self.condition_on_past_actions:
+            if exists(last_fine_action):
+                last_fine_action_emb = self.fine_action_emb(rearrange(last_fine_action, 'b -> b 1'))
+                state_repr = state_repr + last_fine_action_emb
+            else:
+                start_token = repeat(self.fine_action_start_token, 'd -> b 1 d', b = state_repr.shape[0])
+                state_repr = state_repr + start_token
 
         dec_out, transformer_cache = self.metacontroller(
             state_repr,
@@ -741,7 +763,7 @@ class Metacontroller(nn.Module):
             state_scale = state_scale
         )
 
-        next_cache = (transformer_cache, pred_high_action.detach())
+        next_cache = (transformer_cache, pred_high_action.detach(), action.detach())
 
         return action, entropy, critic_logits, next_cache
 
@@ -965,6 +987,7 @@ def train_metacontroller(
     evaluate = False,
     train_discovery = False,
     train_joint_metacontroller = False,
+    condition_on_past_actions = False,
     train_evo_strat = False,
     evo_strat_generations = 100,
     evo_strat_population_size = 64,
@@ -1215,7 +1238,7 @@ def train_metacontroller(
             rollout_model = discovery_mod
             rollout_forward_has_cache = True
 
-        metacontroller = Metacontroller(discovery_mod = discovery_mod).to(device)
+        metacontroller = Metacontroller(discovery_mod = discovery_mod, condition_on_past_actions = condition_on_past_actions).to(device)
         meta_optimizer = Adam(metacontroller.parameters(), lr = 3e-4)
 
         metacontroller, meta_optimizer = accelerator.prepare(metacontroller, meta_optimizer)
