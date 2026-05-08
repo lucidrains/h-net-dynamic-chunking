@@ -4,9 +4,10 @@ from collections import namedtuple
 
 import torch
 from torch import cat, arange, tensor, repeat_interleave
-from torch.nested import nested_tensor
+from torch.nn.utils.rnn import pad_sequence
 from torch.nn import Module, Linear, Parameter, Sequential, RMSNorm, Identity
 from torch.nn.functional import cosine_similarity, pad
+from torch.nn.utils.rnn import pad_sequence
 
 from einx import multiply
 from einops import repeat, rearrange
@@ -254,10 +255,7 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         boundary_mask_with_end = pad(boundary_mask, (0, 1), value = True)
         sel_indices = boundary_mask_with_end.nonzero()[:, 1]
-
-        sel_indices = nested_tensor(sel_indices.split((num_chunks + 1).tolist()), layout = torch.jagged, device = device)
-
-        sel_indices = sel_indices.to_padded_tensor(padding = -1)
+        sel_indices = pad_sequence(sel_indices.split((num_chunks + 1).tolist()), batch_first=True, padding_value=-1)
 
         mask = (sel_indices != -1)[:, 1:]
 
@@ -275,13 +273,9 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         boundary_tokens = tokens[boundary_mask] # pick out boundary tokens
 
-        tokens_nt = nested_tensor(boundary_tokens.split(num_chunks.tolist()), layout = torch.jagged, device = device, requires_grad = True)
+        downsampled_tokens = pad_sequence(boundary_tokens.split(num_chunks.tolist()), batch_first=True, padding_value=0.)
 
-        downsampled_tokens = tokens_nt.to_padded_tensor(padding = 0.)
-
-        probs_nt = nested_tensor(probs[boundary_mask].split(num_chunks.tolist()), layout = torch.jagged, device = device, requires_grad = True)
-
-        boundary_probs = probs_nt.to_padded_tensor(padding = 0.)
+        boundary_probs = pad_sequence(probs[boundary_mask].split(num_chunks.tolist()), batch_first=True, padding_value=0.)
 
         gates = 1. - boundary_probs
 

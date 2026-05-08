@@ -56,6 +56,7 @@ from hl_gauss_pytorch import HLGaussLoss
 from discrete_continuous_embed_readout import Readout
 from memmap_replay_buffer import ReplayBuffer
 from torch_einops_utils.save_load import save_load
+from torch_einops_utils import lens_to_mask
 from assoc_scan import AssocScan
 from x_transformers import Decoder
 from vector_quantize_pytorch import VectorQuantize
@@ -169,6 +170,7 @@ class DiscoveryModule(nn.Module):
         self.hnet_prenorm = nn.LayerNorm(dim, elementwise_affine = False)
 
         self.discrete_high_actions = discrete_high_actions
+
         vq = None
         if discrete_high_actions:
             vq = VectorQuantize(
@@ -200,9 +202,13 @@ class DiscoveryModule(nn.Module):
         self.action_readout = Readout(dim = dim, num_discrete = action_dim)
         self.to_next_state = nn.Linear(dim, state_dim)
 
-    def forward(self, states, actions, mask = None, return_loss_breakdown = False, extract_high_level_actions = False):
+    def forward(self, states, actions, mask = None, episode_lens = None, return_loss_breakdown = False, extract_high_level_actions = False):
         b, n = states.shape[:2]
         device = states.device
+
+        if exists(episode_lens):
+            assert not exists(mask)
+            mask = lens_to_mask(episode_lens, max_len = n)
 
         # interleave [s0, a0, s1, a1, ...]
 
@@ -233,6 +239,14 @@ class DiscoveryModule(nn.Module):
         if extract_high_level_actions:
             intermediates = hnet_ret.intermediates
             extracted = intermediates.quantized_downsampled_indices if self.discrete_high_actions else intermediates.input_downsampled_tokens
+
+            if exists(mask):
+                high_level_mask = intermediates.mask
+                if self.discrete_high_actions:
+                    extracted = extracted.masked_fill(~high_level_mask, -1)
+                else:
+                    extracted = extracted.masked_fill(~high_level_mask.unsqueeze(-1), 0.)
+
             return extracted, intermediates.chunk_lens
 
         # re-interleave: hnet-processed states + raw actions
@@ -608,7 +622,7 @@ class Metacontroller(nn.Module):
             logits = logits[flat_mask]
             actions_flat = actions_flat[flat_mask]
 
-        loss_low = F.cross_entropy(logits, actions_flat)
+        loss_low = F.cross_entropy(logits, actions_flat.long())
 
         # combine
 
@@ -747,8 +761,7 @@ def evaluate_agent(
     shutil.rmtree(video_folder, ignore_errors = True)
 
     original_device = next(model.parameters()).device
-    model = model.to('cpu')
-    device = 'cpu'
+    model = model.to(device)
 
     env = gym.make(env_name, render_mode = 'rgb_array' if render_videos else None)
 
@@ -903,7 +916,7 @@ def train_metacontroller(
     record_video_every = 50,
     use_wandb = False,
     target_avg_cum_reward = -50.0,
-    margin_of_error = 25.0,
+    margin_of_error = 5.0,
     evaluate = False,
     train_discovery = False,
     train_joint_metacontroller = False,
@@ -1145,6 +1158,18 @@ def train_metacontroller(
             print(f'Loading existing {discovery_pt_name} for Joint Metacontroller optimization...')
             discovery_mod.load_state_dict(torch.load(discovery_pt_name, map_location = device))
 
+        ppo_agent = ActorCritic(state_dim = 8, action_dim = 4).to(device)
+        ppo_expert_exists = Path(load_path).exists()
+        if ppo_expert_exists:
+            print(f'Loading PPO agent from {load_path} for Joint Metacontroller rollouts...')
+            ppo_agent.load_state_dict(torch.load(load_path, map_location = device))
+            rollout_model = ppo_agent
+            rollout_forward_has_cache = False
+        else:
+            print('PPO agent not found. Falling back to Discovery Module for rollouts.')
+            rollout_model = discovery_mod
+            rollout_forward_has_cache = True
+
         metacontroller = Metacontroller(discovery_mod = discovery_mod).to(device)
         meta_optimizer = Adam(metacontroller.parameters(), lr = 3e-4)
 
@@ -1165,8 +1190,9 @@ def train_metacontroller(
                 buffer = ReplayBuffer.from_folder('./joint_metacontroller_buffer')
             else:
                 gather_episodes = int(batch_size / filter_top_percentile)
+
                 _, buffer = evaluate_agent(
-                    model = discovery_mod,
+                    model = rollout_model,
                     num_episodes = gather_episodes,
                     video_folder = 'joint_gather_videos',
                     record_every = 0,
@@ -1176,7 +1202,7 @@ def train_metacontroller(
                     buffer_folder = './joint_metacontroller_buffer',
                     render_videos = False,
                     filter_top_percentile = filter_top_percentile,
-                    forward_has_cache = True,
+                    forward_has_cache = rollout_forward_has_cache,
                     max_timesteps = max_timesteps,
                     desc = 'Gathering Expert Trajectories'
                 )

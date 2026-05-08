@@ -7,6 +7,7 @@ import inspect
 import torch
 from torch import nn, tensor
 from torch.nn import Module
+from torch.nn.utils.rnn import pad_sequence
 
 from torch_einops_utils import exclusive_cumsum
 
@@ -193,14 +194,7 @@ class HNet(Module):
             if has_chunks:
                 num_chunks = intermediate.boundary_mask.long().sum(dim = -1)
                 boundary_indices = indices[intermediate.boundary_mask]
-
-                indices_nt = torch.nested.nested_tensor(
-                    boundary_indices.split(num_chunks.tolist()),
-                    layout = torch.jagged,
-                    device = self.device
-                )
-
-                quantized_downsampled_indices = indices_nt.to_padded_tensor(padding = -1)
+                quantized_downsampled_indices = pad_sequence(boundary_indices.split(num_chunks.tolist()), batch_first = True, padding_value = -1)
 
             intermediate = intermediate._replace(
                 quantized_downsampled_indices = quantized_downsampled_indices
