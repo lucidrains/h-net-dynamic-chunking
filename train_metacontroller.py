@@ -15,7 +15,7 @@
 #     "tqdm",
 #     "vector-quantize-pytorch",
 #     "wandb",
-#     "x-evolution>=0.0.20",
+#     "x-evolution>=0.1.32",
 #     "x-mlps-pytorch",
 #     "x-transformers"
 # ]
@@ -1421,14 +1421,6 @@ def train_metacontroller(
                 quiet = True
             )
 
-        def centered_rank_normalize(fitnesses):
-            shape = fitnesses.shape
-            flat_fitnesses = fitnesses.flatten()
-            ranks = torch.empty_like(flat_fitnesses)
-            ranks[flat_fitnesses.argsort()] = torch.arange(len(flat_fitnesses), dtype = fitnesses.dtype, device = fitnesses.device)
-            ranks = (ranks / (len(flat_fitnesses) - 1)) - 0.5
-            return ranks.reshape(shape)
-
         evo = EvoStrategy(
             model = discovery_mod,
             environment = evo_strat_environment,
@@ -1437,7 +1429,7 @@ def train_metacontroller(
             learning_rate = evo_strat_learning_rate,
             noise_scale = evo_strat_noise_scale,
             optimizer_klass = Adam,
-            fitness_to_weighted_factor = centered_rank_normalize,
+            fitness_to_weighted_factor = 'centered_rank_normalize',
             params_to_optimize = [discovery_mod.hnet.network]
         )
 
