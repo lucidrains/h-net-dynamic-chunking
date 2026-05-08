@@ -514,6 +514,11 @@ class Metacontroller(nn.Module):
             **lower_controller_kwargs
         )
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.discovery_mod.eval()
+        return self
+
     def maybe_cfg_dropout(
         self,
         states,
@@ -756,7 +761,9 @@ def evaluate_agent(
     temperature = 1.,
     high_temperature = 1.,
     max_timesteps = 1000,
-    desc = 'Evaluating Agent'
+    desc = 'Evaluating Agent',
+    force_drop_condition = False,
+    force_drop_state = False
 ):
     shutil.rmtree(video_folder, ignore_errors = True)
 
@@ -810,6 +817,8 @@ def evaluate_agent(
                 kwargs = dict(cache = cache) if forward_has_cache else dict()
                 if isinstance(unwrapped_model, Metacontroller):
                     kwargs['high_temperature'] = high_temperature
+                    kwargs['force_drop_condition'] = force_drop_condition
+                    kwargs['force_drop_state'] = force_drop_state
 
                 action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs, temperature = temperature)
 
@@ -850,6 +859,8 @@ def evaluate_agent(
                 kwargs = dict(cache = cache) if forward_has_cache else dict()
                 if isinstance(unwrapped_model, Metacontroller):
                     kwargs['high_temperature'] = high_temperature
+                    kwargs['force_drop_condition'] = force_drop_condition
+                    kwargs['force_drop_state'] = force_drop_state
 
                 action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs, temperature = temperature)
 
@@ -1260,8 +1271,40 @@ def train_metacontroller(
                 quiet = False
             )
 
+            print('\nEvaluating Metacontroller (Reflexive Only)...')
+            reflexive_eval_reward = evaluate_agent(
+                model = unwrapped_mod,
+                num_episodes = eval_episodes,
+                video_folder = 'metacontroller_reflexive_eval_videos',
+                record_every = 5,
+                device = device,
+                seed = seed + loop_count * 1000 + 1,
+                store_buffer = False,
+                forward_has_cache = True,
+                quiet = False,
+                force_drop_condition = True
+            )
+
+            print('\nEvaluating Metacontroller (High Action Only)...')
+            high_action_only_eval_reward = evaluate_agent(
+                model = unwrapped_mod,
+                num_episodes = eval_episodes,
+                video_folder = 'metacontroller_high_action_only_eval_videos',
+                record_every = 5,
+                device = device,
+                seed = seed + loop_count * 1000 + 2,
+                store_buffer = False,
+                forward_has_cache = True,
+                quiet = False,
+                force_drop_state = True
+            )
+
             if use_wandb:
-                wandb.log(dict(metacontroller_eval_reward = eval_reward))
+                wandb.log(dict(
+                    metacontroller_eval_reward = eval_reward,
+                    reflexive_eval_reward = reflexive_eval_reward,
+                    high_action_only_eval_reward = high_action_only_eval_reward
+                ))
 
             if eval_reward > best_eval_reward:
                 best_eval_reward = eval_reward
