@@ -426,8 +426,32 @@ class ConditionedActorCritic(nn.Module):
         features = self.actor_mlp(features)
         return self.actor_readout(features)
 
-    def get_action_and_value(self, state, condition, action = None, temperature = 1.):
+    def forward_with_cfg(self, state, condition, cond_scale = 1., state_scale = 1.):
+        """ classifier free guidance - scale away from null-condition or null-state """
+
         logits = self.forward(state, condition)
+
+        if cond_scale == 1. and state_scale == 1.:
+            return logits
+
+        assert not (cond_scale != 1. and state_scale != 1.), 'cannot guide on both condition and state simultaneously'
+
+        if cond_scale != 1.:
+            null_logits = self.forward(state, torch.zeros_like(condition))
+            scale = cond_scale
+        else:
+            null_logits = self.forward(torch.zeros_like(state), condition)
+            scale = state_scale
+
+        is_tuple = isinstance(logits, tuple)
+        logits_tensor = logits[0] if is_tuple else logits
+        null_logits_tensor = null_logits[0] if is_tuple else null_logits
+
+        cfg_logits = null_logits_tensor + (logits_tensor - null_logits_tensor) * scale
+        return (cfg_logits,) if is_tuple else cfg_logits
+
+    def get_action_and_value(self, state, condition, action = None, temperature = 1., cond_scale = 1., state_scale = 1.):
+        logits = self.forward_with_cfg(state, condition, cond_scale = cond_scale, state_scale = state_scale)
         logits = cast_tuple(logits)[0]
 
         if not exists(action):
@@ -646,7 +670,9 @@ class Metacontroller(nn.Module):
         temperature = 1.,
         high_temperature = 1.,
         force_drop_condition = False,
-        force_drop_state = False
+        force_drop_state = False,
+        cond_scale = 1.,
+        state_scale = 1.
     ):
         is_caching = exists(cache)
         state_seq = rearrange(state, 'b d -> b 1 d')
@@ -710,7 +736,9 @@ class Metacontroller(nn.Module):
             state_cond,
             high_cond,
             action = action,
-            temperature = temperature
+            temperature = temperature,
+            cond_scale = cond_scale,
+            state_scale = state_scale
         )
 
         next_cache = (transformer_cache, pred_high_action.detach())
@@ -763,7 +791,9 @@ def evaluate_agent(
     max_timesteps = 1000,
     desc = 'Evaluating Agent',
     force_drop_condition = False,
-    force_drop_state = False
+    force_drop_state = False,
+    cond_scale = 1.,
+    state_scale = 1.
 ):
     shutil.rmtree(video_folder, ignore_errors = True)
 
@@ -819,6 +849,8 @@ def evaluate_agent(
                     kwargs['high_temperature'] = high_temperature
                     kwargs['force_drop_condition'] = force_drop_condition
                     kwargs['force_drop_state'] = force_drop_state
+                    kwargs['cond_scale'] = cond_scale
+                    kwargs['state_scale'] = state_scale
 
                 action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs, temperature = temperature)
 
@@ -861,6 +893,8 @@ def evaluate_agent(
                     kwargs['high_temperature'] = high_temperature
                     kwargs['force_drop_condition'] = force_drop_condition
                     kwargs['force_drop_state'] = force_drop_state
+                    kwargs['cond_scale'] = cond_scale
+                    kwargs['state_scale'] = state_scale
 
                 action, *_, cache = unwrapped_model.get_action_and_value(state_tensor, **kwargs, temperature = temperature)
 
