@@ -482,7 +482,10 @@ class Metacontroller(nn.Module):
         condition_dropout = 0.5,
         state_dropout = 0.2,
         condition_on_past_actions = False,
-        lower_controller_kwargs: dict | None = None
+        lower_controller_kwargs: dict | None = None,
+        hl_gauss_min_value = -400.,
+        hl_gauss_max_value = 400.,
+        hl_gauss_num_bins = 256
     ):
         super().__init__()
         assert (condition_dropout + state_dropout) <= 1., 'condition and state dropout must sum to at most 1'
@@ -535,6 +538,14 @@ class Metacontroller(nn.Module):
             continuous_log_var_embed = False,
             regression_loss_type = 'mse'
         )
+
+        self.hl_gauss_loss = HLGaussLoss(
+            min_value = hl_gauss_min_value,
+            max_value = hl_gauss_max_value,
+            num_bins = hl_gauss_num_bins
+        )
+        self.critic_mlp = MLP(dim, 128, 256, 256)
+
 
         lower_controller_kwargs = default(lower_controller_kwargs, dict())
         self.lower_controller = ConditionedActorCritic(
@@ -690,7 +701,8 @@ class Metacontroller(nn.Module):
         force_drop_condition = False,
         force_drop_state = False,
         cond_scale = 1.,
-        state_scale = 1.
+        state_scale = 1.,
+        extract_high_level_actions = False
     ):
         is_caching = exists(cache)
         state_seq = rearrange(state, 'b d -> b 1 d')
@@ -723,7 +735,17 @@ class Metacontroller(nn.Module):
 
         if is_discrete:
             # high_action_readout is a Discrete Readout
-            pred_high_action = self.high_action_readout.sample(rearrange(dec_out, 'b 1 d -> b d'), temperature=high_temperature)
+            high_action_logits = self.high_action_readout(rearrange(dec_out, 'b 1 d -> b d'))
+
+            if not exists(action) or not extract_high_level_actions:
+                pred_high_action = self.high_action_readout.sample(high_action_logits, temperature=high_temperature)
+            else:
+                pred_high_action = action
+
+            probs = torch.distributions.Categorical(logits = high_action_logits)
+            high_log_prob = probs.log_prob(pred_high_action)
+            high_entropy = probs.entropy()
+
             action_token = self.action_emb_proj(pred_high_action.detach())
             action_token = rearrange(action_token, 'b d -> b 1 d')
         else:
@@ -759,18 +781,26 @@ class Metacontroller(nn.Module):
         state_cond = rearrange(state_cond, 'b 1 d -> b d')
         high_cond = rearrange(high_cond, 'b 1 d -> b d')
 
-        action, _, entropy, _, critic_logits = self.lower_controller.get_action_and_value(
+        action_out, _, entropy, _, critic_logits = self.lower_controller.get_action_and_value(
             state_cond,
             high_cond,
-            action = action,
+            action = action if not extract_high_level_actions else None,
             temperature = temperature,
             cond_scale = cond_scale,
             state_scale = state_scale
         )
 
-        next_cache = (transformer_cache, pred_high_action.detach(), action.detach())
+        next_cache = (transformer_cache, pred_high_action.detach(), action_out.detach())
 
-        return action, entropy, critic_logits, next_cache
+        # Value estimation for higher metacontroller
+        critic_logits_high = self.critic_mlp(rearrange(dec_out, 'b 1 d -> b d'))
+        value_high = self.hl_gauss_loss(critic_logits_high)
+
+        if extract_high_level_actions:
+            return pred_high_action, high_log_prob, high_entropy, value_high, critic_logits_high
+
+        return action_out, entropy, critic_logits, next_cache, pred_high_action, high_log_prob, value_high
+
 
 # gae using associative scan
 
@@ -988,6 +1018,10 @@ def train_metacontroller(
     record_video_every = 50,
     use_wandb = False,
     target_avg_cum_reward = -50.0,
+    ppo_joint_target_avg_cum_reward = 75.0,
+    ppo_joint_total_episodes = 5000,
+    ppo_joint_update_every = 25,
+    ppo_joint_epochs = 2,
     margin_of_error = 5.0,
     evaluate = False,
     train_discovery = False,
@@ -995,6 +1029,7 @@ def train_metacontroller(
     condition_on_past_actions = False,
     train_evo_strat = False,
     train_evo_strat_joint = False,
+    train_ppo_joint = False,
     evo_strat_target = 'inner',
     evo_strat_joint_target = 'higher',
     evo_strat_generations = 100,
@@ -1057,6 +1092,8 @@ def train_metacontroller(
             run_name = 'evolutionary_strategy_phase'
         elif train_evo_strat_joint:
             run_name = 'joint_evolutionary_strategy_phase'
+        elif train_ppo_joint:
+            run_name = 'joint_ppo_phase'
         else:
             run_name = 'initial_policy_optimization'
         wandb.init(project = 'h-net-dynamic-chunking', name = run_name, config = dict(
@@ -1586,6 +1623,217 @@ def train_metacontroller(
                     break
 
             accelerator.wait_for_everyone()
+
+        return
+
+    # joint ppo training mode
+
+    if train_ppo_joint:
+        model.load_state_dict(torch.load(load_path, map_location = 'cpu', weights_only = False))
+
+        joint_pt_name = 'metacontroller_joint.pt'
+
+        if Path(joint_pt_name).exists():
+            metacontroller = Metacontroller.init_and_load(joint_pt_name, strict = False).to(device)
+        else:
+            discovery_mod = DiscoveryModule(
+                discrete_high_actions = discrete_high_actions,
+                vq_codebook_size = vq_codebook_size,
+                vq_decay = vq_decay,
+                vq_commitment_weight = vq_commitment_weight
+            ).to(device)
+
+            if Path(discovery_pt_name).exists():
+                discovery_mod.load_state_dict(torch.load(discovery_pt_name, map_location = 'cpu', weights_only = False))
+
+            metacontroller = Metacontroller(
+                discovery_mod,
+                condition_on_past_actions = condition_on_past_actions
+            ).to(device)
+
+        meta_optimizer = Adam(metacontroller.parameters(), lr = lr)
+        metacontroller, meta_optimizer = accelerator.prepare(metacontroller, meta_optimizer)
+
+        recent_rewards = deque(maxlen = rolling_window)
+        pbar = tqdm(range(ppo_joint_total_episodes), desc = 'Joint PPO')
+
+        buffer_dir = Path('./ppo_joint_buffer')
+        buffer_dir.mkdir(exist_ok = True)
+
+        buffer = ReplayBuffer(
+            folder = buffer_dir,
+            max_episodes = ppo_joint_update_every * 2,
+            max_timesteps = max_timesteps,
+            circular = True,
+            fields = dict(
+                state = ('float', (8,)),
+                action = ('int', ()),
+                log_prob = ('float', ()),
+                advantage = ('float', ()),
+                return_ = ('float', ())
+            )
+        )
+
+        for ep in pbar:
+            state, _ = env.reset(seed = seed + ep)
+
+            ep_states, ep_actions, ep_log_probs = [], [], []
+            ep_rewards, ep_values, ep_dones = [], [], []
+
+            ep_reward_sum = 0.
+            done = False
+            cache = None
+
+            metacontroller.eval()
+
+            with torch.no_grad():
+                for step in range(max_timesteps):
+                    if done:
+                        break
+
+                    state_tensor = rearrange(tensor(state, dtype = torch.float32, device = device), 'd -> 1 d')
+
+                    fine_action, _, _, cache, high_action, high_log_prob, value = metacontroller.get_action_and_value(
+                        state_tensor, cache = cache
+                    )
+
+                    next_state, reward, terminated, truncated, _ = env.step(fine_action.item())
+                    done = terminated or truncated
+
+                    ep_states.append(state)
+                    ep_actions.append(high_action.item())
+                    ep_log_probs.append(high_log_prob.item())
+                    ep_rewards.append(reward)
+                    ep_values.append(value.item())
+                    ep_dones.append(done)
+
+                    state = next_state
+                    ep_reward_sum += reward
+
+            step_count = len(ep_states)
+
+            recent_rewards.append(ep_reward_sum)
+            avg_reward = np.mean(recent_rewards)
+            pbar.set_postfix({'avg': f'{avg_reward:.2f}', 'ep': f'{ep_reward_sum:.2f}'})
+
+            if use_wandb:
+                log_dict = dict(
+                    episode = ep,
+                    reward = ep_reward_sum,
+                    avg_reward_last_20 = avg_reward,
+                    step_count = step_count
+                )
+
+                if record_video_every > 0 and ep % record_video_every == 0:
+                    video_path = f'videos/rl-video-episode-{ep}.mp4'
+                    if os.path.exists(video_path):
+                        log_dict['video'] = wandb.Video(video_path)
+
+                wandb.log(log_dict)
+
+            if avg_reward >= ppo_joint_target_avg_cum_reward and len(recent_rewards) == rolling_window:
+                save_path = 'metacontroller_joint_ppo.pt'
+                torch.save(metacontroller.state_dict(), save_path)
+                print(f'target reward reached ({ppo_joint_target_avg_cum_reward}). saved to {save_path}')
+                break
+
+            # gae
+
+            rewards_t = tensor(ep_rewards, dtype = torch.float32, device = device)
+            values_t = tensor(ep_values, dtype = torch.float32, device = device)
+            masks_t = 1. - tensor(ep_dones, dtype = torch.float32, device = device)
+
+            returns_t = calc_gae(rewards_t, values_t, masks_t, gamma, gae_lambda)
+            advantages_t = returns_t - values_t
+
+            with buffer.one_episode():
+                for t in range(step_count):
+                    buffer.store(
+                        state = ep_states[t],
+                        action = ep_actions[t],
+                        log_prob = ep_log_probs[t],
+                        advantage = advantages_t[t].item(),
+                        return_ = returns_t[t].item()
+                    )
+
+            # ppo update
+
+            if (ep + 1) % ppo_joint_update_every != 0:
+                continue
+
+            metacontroller.train()
+
+            dataloader = buffer.dataloader(
+                batch_size = batch_size,
+                fields = ('state', 'action', 'log_prob', 'advantage', 'return_')
+            )
+
+            for _ in range(ppo_joint_epochs):
+                for batch in dataloader:
+                    states, actions, old_log_probs, advantages, returns = [
+                        batch[k].to(device) for k in ('state', 'action', 'log_prob', 'advantage', 'return_')
+                    ]
+
+                    # flatten trajectory-level to timestep-level, masking padding
+
+                    if states.ndim == 3:
+                        lens = batch.get('_lens', None)
+                        b, s, d = states.shape
+
+                        flat_mask = None
+                        if exists(lens):
+                            mask = lens_to_mask(lens.to(device), max_len = s)
+                            flat_mask = rearrange(mask, 'b s -> (b s)')
+
+                        states, actions, old_log_probs, advantages, returns = [
+                            rearrange(t, 'b s ... -> (b s) ...') for t in (states, actions, old_log_probs, advantages, returns)
+                        ]
+
+                        if exists(flat_mask):
+                            states, actions, old_log_probs, advantages, returns = [
+                                t[flat_mask] for t in (states, actions, old_log_probs, advantages, returns)
+                            ]
+
+                    if advantages.numel() > 1:
+                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+                    # fresh high-level logits from state projection (no KV cache)
+
+                    state_repr = metacontroller.state_proj(states)
+                    dec_out = metacontroller.metacontroller(rearrange(state_repr, 'n d -> n 1 d'))
+                    dec_out = rearrange(dec_out, 'n 1 d -> n d')
+
+                    logits = metacontroller.high_action_readout(dec_out)
+                    probs = torch.distributions.Categorical(logits = logits)
+                    new_log_probs = probs.log_prob(actions.long())
+                    entropy = probs.entropy().mean()
+
+                    critic_logits = metacontroller.critic_mlp(dec_out)
+
+                    delight_gate = (-new_log_probs * advantages).sigmoid().detach()
+                    gated_advantages = advantages * delight_gate
+
+                    ratio = (new_log_probs - old_log_probs).exp()
+                    policy_loss = torch.max(
+                        -gated_advantages * ratio,
+                        -gated_advantages * ratio.clamp(1 - clip_coef, 1 + clip_coef)
+                    ).mean()
+
+                    value_loss = metacontroller.hl_gauss_loss(critic_logits, returns)
+                    loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+
+                    meta_optimizer.zero_grad()
+                    accelerator.backward(loss)
+                    nn.utils.clip_grad_norm_(metacontroller.parameters(), 0.5)
+                    meta_optimizer.step()
+
+                    if use_wandb:
+                        wandb.log(dict(
+                            ppo_joint_loss = loss.item(),
+                            ppo_joint_policy_loss = policy_loss.item(),
+                            ppo_joint_value_loss = value_loss.item(),
+                            ppo_joint_entropy = entropy.item()
+                        ))
 
         return
 

@@ -42,3 +42,7 @@ train-evo-strat-joint-cpu pop="200" target="higher" discrete="True" lr="5e-4" no
 # Optimize the Joint Metacontroller (higher/lower) with Evolutionary Strategies using Torchrun
 train-evo-strat-joint-distributed-cpu numprocs="10" pop="200" target="higher" discrete="True" lr="5e-4" noise="0.005":
     uv run torchrun --nproc_per_node={{numprocs}} train_metacontroller.py --train_evo_strat_joint=True --use_wandb=True --cpu=True --evo_strat_population_size={{pop}} --evo_strat_joint_target={{target}} --discrete_high_actions={{discrete}} --evo_strat_learning_rate={{lr}} --evo_strat_noise_scale={{noise}}
+
+# Optimize the Joint Metacontroller with PPO (Joint PPO) on one machine
+train-ppo-joint-cpu discrete="True":
+    uv run train_metacontroller.py --train_ppo_joint=True --use_wandb=True --cpu=True --discrete_high_actions={{discrete}}
