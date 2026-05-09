@@ -232,7 +232,7 @@ class DiscoveryModule(nn.Module):
         state_out = dec1_out[:, 0::2]
         action_out = dec1_out[:, 1::2]
 
-        hnet_ret = self.hnet(self.hnet_prenorm(state_out), vq_mask = mask, return_intermediates = extract_high_level_actions)
+        hnet_ret = self.hnet(self.hnet_prenorm(state_out), lens = episode_lens, vq_mask = mask, return_intermediates = extract_high_level_actions)
         hnet_state_out = hnet_ret.output
         hnet_aux_loss = hnet_ret.loss
 
@@ -588,17 +588,22 @@ class Metacontroller(nn.Module):
         states,
         actions,
         mask = None,
+        episode_lens = None,
         return_loss_breakdown = False,
         force_drop_condition = False,
         force_drop_state = False
     ):
         batch, seq, device = *states.shape[:2], states.device
 
+        if exists(episode_lens):
+            assert not exists(mask)
+            mask = lens_to_mask(episode_lens, max_len = seq)
+
         # extract teacher higher level actions
 
         with torch.no_grad():
             self.discovery_mod.eval()
-            raw_target_high_actions, chunk_lens = self.discovery_mod(states, actions, extract_high_level_actions = True)
+            raw_target_high_actions, chunk_lens = self.discovery_mod(states, actions, mask = mask, episode_lens = episode_lens, extract_high_level_actions = True)
 
             flat_target_high_actions = rearrange(raw_target_high_actions, 'b c ... -> (b c) ...')
             flat_chunk_lens = rearrange(chunk_lens, 'b c -> (b c)')
@@ -1142,11 +1147,7 @@ def train_metacontroller(
 
                     states, actions, lens = [batch[k].to(device) for k in ('state', 'action', '_lens')]
 
-                    # build mask from episode lengths
-
-                    mask = rearrange(torch.arange(states.shape[1], device = device), 'n -> 1 n') < rearrange(lens, 'b -> b 1')
-
-                    loss, breakdown = discovery_mod(states, actions, mask = mask, return_loss_breakdown = True)
+                    loss, breakdown = discovery_mod(states, actions, episode_lens = lens, return_loss_breakdown = True)
 
                     assert not torch.isnan(loss), 'NaN loss detected during discovery training!'
 
@@ -1293,9 +1294,7 @@ def train_metacontroller(
 
                     states, actions, lens = [batch[k].to(device) for k in ('state', 'action', '_lens')]
 
-                    mask = rearrange(torch.arange(states.shape[1], device = device), 'n -> 1 n') < rearrange(lens, 'b -> b 1')
-
-                    loss, breakdown = metacontroller(states, actions, mask = mask, return_loss_breakdown = True)
+                    loss, breakdown = metacontroller(states, actions, episode_lens = lens, return_loss_breakdown = True)
 
                     meta_optimizer.zero_grad()
                     accelerator.backward(loss)

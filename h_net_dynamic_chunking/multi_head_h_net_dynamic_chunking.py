@@ -14,6 +14,7 @@ from einops import repeat, rearrange
 from einops.layers.torch import Rearrange, Reduce
 
 from assoc_scan import AssocScan
+from torch_einops_utils import lens_to_mask, pad_right_at_dim_to, masked_mean
 
 # constants
 
@@ -191,8 +192,11 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         # get the mask and residual from downsample steps
 
-        upsampled = repeat_interleave(downsampled[mask], intermediates.chunk_lens[mask], dim = 0)
-        upsampled = rearrange(upsampled, '(b n) d -> b n d', b = batch)
+        upsampled_flat = repeat_interleave(downsampled[mask], intermediates.chunk_lens[mask], dim = 0)
+        effective_lens = intermediates.chunk_lens.sum(dim = -1)
+        upsampled = pad_sequence(upsampled_flat.split(effective_lens.tolist()), batch_first = True, padding_value = 0.)
+
+        upsampled = pad_right_at_dim_to(upsampled, residual.shape[1], dim = 1)
 
         scale = intermediates.upsampler_output_scale
 
@@ -216,6 +220,7 @@ class MultiHeadDynamicSequenceChunker(Module):
     def forward(
         self,
         tokens, # float[b n d],
+        lens = None,
         return_intermediates = False,
         return_only_chunk_lens = False
     ):
@@ -249,11 +254,21 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         boundary_mask[:, 0] = True # first token must always be boundary
 
+        if exists(lens):
+            lens = repeat(lens, 'b -> (h b)', h = heads)
+            seq_mask = lens_to_mask(lens, max_len = length)
+            boundary_mask = boundary_mask & seq_mask
+
         # compute some lengths, per chunk and number of chunks per batch
 
         num_chunks = boundary_mask.long().sum(dim = -1)
 
-        boundary_mask_with_end = pad(boundary_mask, (0, 1), value = True)
+        if exists(lens):
+            boundary_mask_with_end = pad(boundary_mask, (0, 1), value = False)
+            boundary_mask_with_end.scatter_(1, lens[:, None].long(), True)
+        else:
+            boundary_mask_with_end = pad(boundary_mask, (0, 1), value = True)
+
         sel_indices = boundary_mask_with_end.nonzero()[:, 1]
         sel_indices = pad_sequence(sel_indices.split((num_chunks + 1).tolist()), batch_first=True, padding_value=-1)
 
@@ -304,7 +319,10 @@ class MultiHeadDynamicSequenceChunker(Module):
             N = self.target_avg_token_length
 
             F = boundary_mask.float()
-            G = probs.mean(dim = -1)
+
+            mask_for_mean = seq_mask if exists(lens) else None
+
+            G = masked_mean(probs, mask = mask_for_mean, dim = -1)
 
             # allow for a soft F to straight through - https://arxiv.org/abs/2505.22074
 
@@ -312,7 +330,7 @@ class MultiHeadDynamicSequenceChunker(Module):
                 F_soft = (probs - self.boundary_threshold).sigmoid()
                 F = straight_through(F_soft, F)
 
-            F = F.mean(dim = -1)
+            F = masked_mean(F, mask = mask_for_mean, dim = -1)
 
             aux_ratio_loss = N / (N - 1) * ((N - 1) * F * G + (1. - F) * (1. - G))
 

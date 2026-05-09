@@ -141,6 +141,7 @@ class HNet(Module):
     def forward(
         self,
         tokens,
+        lens = None,
         return_intermediates = False,
         return_hiddens = False,
         cache = None,
@@ -179,6 +180,7 @@ class HNet(Module):
 
         (downsampled, upsample, aux_ratio_loss), intermediate = self.dynamic_sequence_chunker(
             encoded,
+            lens = lens,
             return_intermediates = True,
             cache = chunker_cache
         )
@@ -220,7 +222,8 @@ class HNet(Module):
             inner_network_output = maybe_projected_downsampled
 
         elif self._is_nested_hnet:
-            out = self.network(maybe_projected_downsampled, cache = inner_cache, return_hiddens = is_caching, return_intermediates = True)
+            inner_lens = (intermediate.chunk_lens > 0).sum(dim=-1)
+            out = self.network(maybe_projected_downsampled, lens = inner_lens, cache = inner_cache, return_hiddens = is_caching, return_intermediates = True)
 
             inner_network_output = out.output
             maybe_inner_aux_ratio_loss = out.loss

@@ -20,6 +20,41 @@ def test_chunker(
 
     assert upsample_fn(downsampled).shape == tokens.shape
 
+@param('has_lens', (False, True))
+@param('handle_residual_proj', (False, True))
+def test_chunker_with_lens(
+    has_lens,
+    handle_residual_proj
+):
+    from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicSequenceChunker
+
+    batch, max_len, dim = 4, 64, 128
+
+    downsampler = DynamicSequenceChunker(dim, handle_residual_proj = handle_residual_proj)
+
+    tokens = torch.randn(batch, max_len, dim).requires_grad_()
+
+    lens = torch.tensor([17, 32, 64, 25]) if has_lens else None
+
+    # test chunk_lens sum
+
+    chunk_lens = downsampler(tokens, lens = lens, return_only_chunk_lens = True)
+    chunk_sums = chunk_lens.sum(dim = -1)
+
+    expected = lens if has_lens else torch.full((batch,), max_len)
+    assert (chunk_sums == expected).all(), f'chunk_lens.sum() {chunk_sums.tolist()} != expected {expected.tolist()}'
+
+    # test full forward + upsample
+
+    downsampled, upsample_fn, aux_loss = downsampler(tokens, lens = lens)
+
+    upsampled = upsample_fn(downsampled)
+    assert upsampled.shape == tokens.shape
+
+    # test backward
+
+    (upsampled.sum() + aux_loss).backward()
+
 def test_hnet():
     from torch import nn
     from h_net_dynamic_chunking.h_net import HNet
@@ -51,6 +86,45 @@ def test_hnet():
 
     out = net(tokens, return_intermediates = True)
     assert all(isinstance(el, Intermediates) for el in out.intermediates)
+
+@param('has_lens', (False, True))
+@param('handle_residual_proj', (False, True))
+def test_multihead_chunker_with_lens(
+    has_lens,
+    handle_residual_proj
+):
+    from h_net_dynamic_chunking.multi_head_h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
+
+    batch, max_len, dim, heads = 4, 64, 128, 4
+
+    downsampler = MultiHeadDynamicSequenceChunker(dim, heads=heads, handle_residual_proj=handle_residual_proj)
+
+    tokens = torch.randn(batch, max_len, dim).requires_grad_()
+
+    lens = torch.tensor([17, 32, 64, 25]) if has_lens else None
+
+    # test chunk_lens sum
+
+    chunk_lens = downsampler(tokens, lens = lens, return_only_chunk_lens = True)
+    chunk_sums = chunk_lens.sum(dim = -1)
+
+    expected = lens if has_lens else torch.full((batch,), max_len)
+
+    # since chunk_lens has shape (heads * batch), we expect it to match repeated lens
+    expected = expected.repeat(heads)
+
+    assert (chunk_sums == expected).all(), f'chunk_lens.sum() {chunk_sums.tolist()} != expected {expected.tolist()}'
+
+    # test full forward + upsample
+
+    downsampled, upsample_fn, aux_loss = downsampler(tokens, lens = lens)
+
+    upsampled = upsample_fn(downsampled)
+    assert upsampled.shape == tokens.shape
+
+    # test backward
+
+    (upsampled.sum() + aux_loss).backward()
 
 def test_multihead_hnet():
     from h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
