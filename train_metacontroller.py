@@ -994,10 +994,13 @@ def train_metacontroller(
     train_joint_metacontroller = False,
     condition_on_past_actions = False,
     train_evo_strat = False,
+    train_evo_strat_joint = False,
+    evo_strat_target = 'inner',
+    evo_strat_joint_target = 'higher',
     evo_strat_generations = 100,
     evo_strat_population_size = 64,
-    evo_strat_learning_rate = 0.01,
-    evo_strat_noise_scale = 0.03,
+    evo_strat_learning_rate = 1e-3,
+    evo_strat_noise_scale = 0.01,
     skip_ppo_eval = False,
     skip_discovery_eval = False,
     max_discovery_steps = 1000,
@@ -1010,20 +1013,6 @@ def train_metacontroller(
     vq_decay = 0.8,
     vq_commitment_weight = 1.
 ):
-    if use_wandb:
-        if train_discovery:
-            run_name = 'behavior_clone_phase'
-        elif train_joint_metacontroller:
-            run_name = 'joint_metacontroller_phase'
-        elif train_evo_strat:
-            run_name = 'evolutionary_strategy_phase'
-        else:
-            run_name = 'initial_policy_optimization'
-        wandb.init(project = 'h-net-dynamic-chunking', name = run_name, config = dict(
-            lr = lr, gamma = gamma, gae_lambda = gae_lambda,
-            clip_coef = clip_coef, entropy_coef = entropy_coef, value_coef = value_coef,
-            epochs = epochs, batch_size = batch_size
-        ))
 
     discovery_pt_name = 'discovery_discrete.pt' if discrete_high_actions else 'discovery_continuous.pt'
     discovery_evo_pt_name = 'discovery_evo_strat_discrete.pt' if discrete_high_actions else 'discovery_evo_strat_continuous.pt'
@@ -1034,16 +1023,47 @@ def train_metacontroller(
     shutil.rmtree('videos', ignore_errors = True)
 
     env = gym.make('LunarLander-v3', render_mode = 'rgb_array')
-    env = gym.wrappers.RecordVideo(
-        env,
-        video_folder = 'videos',
-        episode_trigger = lambda x: x % record_video_every == 0 if record_video_every > 0 else False,
-        disable_logger = True
-    )
+    if not train_evo_strat and not train_evo_strat_joint:
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder = 'videos',
+            episode_trigger = lambda x: x % record_video_every == 0 if record_video_every > 0 else False,
+            disable_logger = True
+        )
 
-    accelerator = Accelerator(cpu = cpu, mixed_precision = 'no')
+    accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
+
+    if accelerator.num_processes > 1:
+        import builtins
+        _original_print = builtins.print
+        builtins.print = lambda *args, **kwargs: _original_print(f'[rank{accelerator.process_index}]', *args, **kwargs)
+
+        if cpu:
+            import torch.distributed as dist
+            orig_barrier = dist.barrier
+            dist.barrier = lambda *args, device_ids = None, **kwargs: orig_barrier(*args, **kwargs)
+
     print(f'Using device: {device}')
+
+    use_wandb = use_wandb and accelerator.is_main_process
+
+    if use_wandb:
+        if train_discovery:
+            run_name = 'behavior_clone_phase'
+        elif train_joint_metacontroller:
+            run_name = 'joint_metacontroller_phase'
+        elif train_evo_strat:
+            run_name = 'evolutionary_strategy_phase'
+        elif train_evo_strat_joint:
+            run_name = 'joint_evolutionary_strategy_phase'
+        else:
+            run_name = 'initial_policy_optimization'
+        wandb.init(project = 'h-net-dynamic-chunking', name = run_name, config = dict(
+            lr = lr, gamma = gamma, gae_lambda = gae_lambda,
+            clip_coef = clip_coef, entropy_coef = entropy_coef, value_coef = value_coef,
+            epochs = epochs, batch_size = batch_size
+        ))
 
     model = ActorCritic(state_dim = 8, action_dim = 4).to(device)
     optimizer = Adam(model.parameters(), lr = lr)
@@ -1053,7 +1073,7 @@ def train_metacontroller(
 
     if evaluate:
         print(f'Loading agent weights from {load_path}...')
-        model.load_state_dict(torch.load(load_path, map_location = device))
+        model.load_state_dict(torch.load(load_path, map_location = 'cpu', weights_only = False))
 
         evaluate_agent(
             model = model,
@@ -1069,7 +1089,7 @@ def train_metacontroller(
 
     if train_discovery:
         print(f'Loading agent weights from {load_path}...')
-        model.load_state_dict(torch.load(load_path, map_location = device))
+        model.load_state_dict(torch.load(load_path, map_location = 'cpu', weights_only = False))
 
         if not skip_ppo_eval:
             avg_reward = evaluate_agent(
@@ -1097,7 +1117,7 @@ def train_metacontroller(
 
         if Path(discovery_pt_name).exists():
             print(f'Loading existing {discovery_pt_name}...')
-            discovery_mod.load_state_dict(torch.load(discovery_pt_name, map_location = device))
+            discovery_mod.load_state_dict(torch.load(discovery_pt_name, map_location = 'cpu', weights_only = False))
 
         disc_optimizer = Adam(discovery_mod.parameters(), lr = 1e-4)
         discovery_mod, disc_optimizer = accelerator.prepare(discovery_mod, disc_optimizer)
@@ -1222,16 +1242,16 @@ def train_metacontroller(
 
         if Path(discovery_evo_pt_name).exists():
             print(f'Loading existing {discovery_evo_pt_name} for Joint Metacontroller optimization...')
-            discovery_mod.load_state_dict(torch.load(discovery_evo_pt_name, map_location = device))
+            discovery_mod.load_state_dict(torch.load(discovery_evo_pt_name, map_location = 'cpu', weights_only = False))
         elif Path(discovery_pt_name).exists():
             print(f'Loading existing {discovery_pt_name} for Joint Metacontroller optimization...')
-            discovery_mod.load_state_dict(torch.load(discovery_pt_name, map_location = device))
+            discovery_mod.load_state_dict(torch.load(discovery_pt_name, map_location = 'cpu', weights_only = False))
 
         ppo_agent = ActorCritic(state_dim = 8, action_dim = 4).to(device)
         ppo_expert_exists = Path(load_path).exists()
         if ppo_expert_exists:
             print(f'Loading PPO agent from {load_path} for Joint Metacontroller rollouts...')
-            ppo_agent.load_state_dict(torch.load(load_path, map_location = device))
+            ppo_agent.load_state_dict(torch.load(load_path, map_location = 'cpu', weights_only = False))
             rollout_model = ppo_agent
             rollout_forward_has_cache = False
         else:
@@ -1390,9 +1410,9 @@ def train_metacontroller(
             vq_decay = vq_decay,
             vq_commitment_weight = vq_commitment_weight
         ).to(device)
-        discovery_mod.load_state_dict(torch.load(discovery_pt_name, map_location = device))
+        discovery_mod.load_state_dict(torch.load(discovery_pt_name, map_location = 'cpu', weights_only = False))
 
-        if not skip_discovery_eval:
+        if not skip_discovery_eval and accelerator.is_main_process:
             print('Running initial validation of discovery.pt...')
             initial_eval_reward = evaluate_agent(
                 model = discovery_mod,
@@ -1407,18 +1427,19 @@ def train_metacontroller(
             )
             print(f'Initial DiscoveryModule Reward: {initial_eval_reward:.2f}')
 
-        def evo_strat_environment(m):
-            return evaluate_agent(
-                model = m,
-                num_episodes = 1,
-                video_folder = 'evo_strat_eval_videos',
-                record_every = 0,
-                device = device,
-                seed = None,
-                render_videos = False,
-                forward_has_cache = True,
-                quiet = True
-            )
+        evo_strat_environment = lambda m: evaluate_agent(
+            model = m, num_episodes = 1, video_folder = '', record_every = 0,
+            device = device, seed = None, render_videos = False,
+            forward_has_cache = True, quiet = True
+        )
+
+        target_to_params = dict(
+            inner = [discovery_mod.hnet.network],
+            outer = [discovery_mod.decoder1, discovery_mod.decoder2],
+            both  = [discovery_mod]
+        )
+        assert evo_strat_target in target_to_params, f'Unknown evo_strat_target: {evo_strat_target}'
+        params_to_optimize = target_to_params[evo_strat_target]
 
         evo = EvoStrategy(
             model = discovery_mod,
@@ -1428,43 +1449,143 @@ def train_metacontroller(
             learning_rate = evo_strat_learning_rate,
             noise_scale = evo_strat_noise_scale,
             optimizer_klass = Adam,
-            fitness_to_weighted_factor = 'centered_rank_normalize',
-            params_to_optimize = [discovery_mod.hnet.network]
+            fitness_to_weighted_factor = 'centered_rank',
+            params_to_optimize = params_to_optimize,
+            cpu = cpu
         )
 
         best_eval_reward = -float('inf')
 
         for gen in range(evo_strat_generations):
-            print(f'\n--- Evo Strat Generation {gen+1}/{evo_strat_generations} ---')
+            if accelerator.is_main_process:
+                print(f'\n--- Evo Strat Generation {gen+1}/{evo_strat_generations} ---')
             evo()
 
-            print('Evaluating deterministic performance...')
-            eval_reward = evaluate_agent(
-                model = discovery_mod,
+            if accelerator.is_main_process:
+                print('Evaluating deterministic performance...')
+                eval_reward = evaluate_agent(
+                    model = discovery_mod,
+                    num_episodes = 20,
+                    video_folder = 'evo_strat_eval_videos',
+                    record_every = 5,
+                    device = device,
+                    seed = seed + gen * 1000,
+                    store_buffer = False,
+                    forward_has_cache = True,
+                    render_videos = True,
+                    quiet = False
+                )
+
+                if use_wandb:
+                    wandb.log(dict(
+                        evo_strat_eval_reward = eval_reward,
+                        evo_strat_generation = gen
+                    ))
+
+                if eval_reward > best_eval_reward:
+                    best_eval_reward = eval_reward
+                    print(f'New best Evo Strat reward: {best_eval_reward:.2f}')
+                    torch.save(discovery_mod.state_dict(), discovery_evo_pt_name)
+
+                if best_eval_reward >= 0:
+                    print(f'Evo Strat reached target reward >= 0! (best: {best_eval_reward:.2f})')
+
+            accelerator.wait_for_everyone()
+
+        return
+
+    # joint metacontroller evolutionary strategies mode
+
+    if train_evo_strat_joint:
+        torch.set_num_threads(1)
+
+        joint_pt_name = 'metacontroller_joint.pt'
+        assert Path(joint_pt_name).exists(), f"Error: {joint_pt_name} not found. Please train the joint metacontroller first."
+
+        print(f'Loading existing {joint_pt_name} for Joint ES optimization...')
+        metacontroller = Metacontroller.init_and_load(joint_pt_name).to(device)
+
+        if accelerator.is_main_process:
+            print('Running initial validation of metacontroller_joint.pt...')
+            initial_eval_reward = evaluate_agent(
+                model = metacontroller,
                 num_episodes = 20,
-                video_folder = 'evo_strat_eval_videos',
-                record_every = 5,
+                video_folder = 'evo_strat_joint_initial_eval_videos',
+                record_every = 0,
                 device = device,
-                seed = seed + gen * 1000,
-                store_buffer = False,
+                seed = seed,
+                render_videos = False,
                 forward_has_cache = True,
-                quiet = False
+                vectorization_mode = 'sync'
             )
+            print(f'Initial Joint Metacontroller Reward: {initial_eval_reward:.2f}')
 
-            if use_wandb:
-                wandb.log(dict(
-                    evo_strat_eval_reward = eval_reward,
-                    evo_strat_generation = gen
-                ))
+        evo_strat_joint_environment = lambda m: evaluate_agent(
+            model = m, num_episodes = 1, video_folder = '', record_every = 0,
+            device = device, seed = None, render_videos = False,
+            forward_has_cache = True, quiet = True
+        )
 
-            if eval_reward > best_eval_reward:
-                best_eval_reward = eval_reward
-                print(f'New best Evo Strat reward: {best_eval_reward:.2f}')
-                torch.save(discovery_mod.state_dict(), discovery_evo_pt_name)
+        joint_target_to_params = dict(
+            higher = [metacontroller.metacontroller],
+            lower  = [metacontroller.lower_controller],
+            both   = [metacontroller]
+        )
+        assert evo_strat_joint_target in joint_target_to_params, f'Unknown evo_strat_joint_target: {evo_strat_joint_target}'
+        joint_params_to_optimize = joint_target_to_params[evo_strat_joint_target]
 
-            if best_eval_reward >= 0:
-                print(f'Evo Strat reached target reward >= 0! (best: {best_eval_reward:.2f})')
-                break
+        evo_joint = EvoStrategy(
+            model = metacontroller,
+            environment = evo_strat_joint_environment,
+            num_generations = 1,
+            noise_population_size = evo_strat_population_size,
+            learning_rate = evo_strat_learning_rate,
+            noise_scale = evo_strat_noise_scale,
+            optimizer_klass = Adam,
+            fitness_to_weighted_factor = 'centered_rank',
+            params_to_optimize = joint_params_to_optimize,
+            cpu = cpu
+        )
+
+        best_eval_reward = -float('inf')
+        joint_evo_pt_name = 'metacontroller_joint_evo_strat.pt'
+
+        for gen in range(evo_strat_generations):
+            if accelerator.is_main_process:
+                print(f'\n--- Joint Evo Strat Generation {gen+1}/{evo_strat_generations} ---')
+            evo_joint()
+
+            if accelerator.is_main_process:
+                print('Evaluating deterministic performance...')
+                eval_reward = evaluate_agent(
+                    model = metacontroller,
+                    num_episodes = 20,
+                    video_folder = 'evo_strat_joint_eval_videos',
+                    record_every = 5,
+                    device = device,
+                    seed = seed + gen * 1000,
+                    store_buffer = False,
+                    forward_has_cache = True,
+                    render_videos = True,
+                    quiet = False
+                )
+
+                if use_wandb:
+                    wandb.log(dict(
+                        evo_strat_joint_eval_reward = eval_reward,
+                        evo_strat_joint_generation = gen
+                    ))
+
+                if eval_reward > best_eval_reward:
+                    best_eval_reward = eval_reward
+                    print(f'New best Joint Evo Strat reward: {best_eval_reward:.2f}')
+                    torch.save(metacontroller.state_dict(), joint_evo_pt_name)
+
+                if best_eval_reward >= target_avg_cum_reward + margin_of_error:
+                    print(f'Joint Evo Strat reached target reward >= {target_avg_cum_reward + margin_of_error:.2f}! (best: {best_eval_reward:.2f})')
+                    break
+
+            accelerator.wait_for_everyone()
 
         return
 
