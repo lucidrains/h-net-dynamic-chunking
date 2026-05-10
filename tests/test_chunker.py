@@ -87,6 +87,13 @@ def test_hnet():
     out = net(tokens, return_intermediates = True)
     assert all(isinstance(el, Intermediates) for el in out.intermediates)
 
+    # validate absolute_chunk_lens at every level sum to original seq len
+
+    seq_len = tokens.shape[1]
+
+    for intermediate in out.intermediates:
+        assert (intermediate.absolute_chunk_lens.sum(dim = -1) == seq_len).all()
+
 @param('has_lens', (False, True))
 @param('handle_residual_proj', (False, True))
 def test_multihead_chunker_with_lens(

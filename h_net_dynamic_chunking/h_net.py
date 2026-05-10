@@ -9,7 +9,7 @@ from torch import nn, tensor
 from torch.nn import Module
 from torch.nn.utils.rnn import pad_sequence
 
-from torch_einops_utils import exclusive_cumsum
+from torch_einops_utils import exclusive_cumsum, pad_left_at_dim
 
 from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicSequenceChunker
 from h_net_dynamic_chunking.multi_head_h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
@@ -36,6 +36,25 @@ def cast_tuple(t):
 def pick(d, *keys):
     d = default(d, dict())
     return tuple(d.get(k) for k in keys)
+
+def calc_absolute_chunk_lens(
+    outer_absolute_lens, # int[b n]
+    inner_chunk_lens     # int[b m]
+):
+    outer_cumsum = outer_absolute_lens.cumsum(dim = -1)
+
+    padded_outer_cumsum = pad_left_at_dim(outer_cumsum, 1, value = 0)
+
+    max_inner_cumsum = padded_outer_cumsum.shape[-1] - 1
+
+    inner_cumsum = inner_chunk_lens.cumsum(dim = -1)
+    inner_cumsum = inner_cumsum.clamp(max = max_inner_cumsum)
+
+    absolute_cumsum = padded_outer_cumsum.gather(1, inner_cumsum)
+
+    padded_absolute_cumsum = pad_left_at_dim(absolute_cumsum, 1, value = 0)
+
+    return padded_absolute_cumsum[:, 1:] - padded_absolute_cumsum[:, :-1]
 
 # check if a module's forward accepts cache and return_hiddens kwargs
 
@@ -266,7 +285,15 @@ class HNet(Module):
         intermediate_out = intermediate
 
         if self._is_nested_hnet:
-            intermediate_out = (intermediate_out, *cast_tuple(inner_intermediates))
+            new_inner_intermediates = []
+            curr_absolute_lens = intermediate.absolute_chunk_lens
+
+            for inner_intermediate in cast_tuple(inner_intermediates):
+                new_abs_lens = calc_absolute_chunk_lens(curr_absolute_lens, inner_intermediate.chunk_lens)
+                new_inner_intermediates.append(inner_intermediate._replace(absolute_chunk_lens = new_abs_lens))
+                curr_absolute_lens = new_abs_lens
+
+            intermediate_out = (intermediate_out, *new_inner_intermediates)
 
         return HNetReturn(
             output,

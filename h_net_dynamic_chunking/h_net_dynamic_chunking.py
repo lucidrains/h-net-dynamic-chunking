@@ -33,8 +33,9 @@ Intermediates = namedtuple('Intermediates', [
     'upsampler_output_scale',
     'input_downsampled_tokens',
     'aux_ratio_loss',
-    'quantized_downsampled_indices'
-], defaults = (None,))
+    'quantized_downsampled_indices',
+    'absolute_chunk_lens'
+], defaults = (None, None))
 
 # helper functions
 
@@ -311,7 +312,7 @@ class DynamicSequenceChunker(Module):
 
         # intermediates
 
-        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, gates, residual, upsampler_output_scale, downsampled_tokens, aux_loss)
+        intermediates = Intermediates(mask, probs, chunk_lens, boundary_mask, gates, residual, upsampler_output_scale, downsampled_tokens, aux_loss, None, chunk_lens)
 
         # return the upsample function
 
