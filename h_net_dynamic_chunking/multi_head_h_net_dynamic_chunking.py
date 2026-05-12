@@ -15,6 +15,7 @@ from einops.layers.torch import Rearrange, Reduce
 
 from assoc_scan import AssocScan
 from torch_einops_utils import lens_to_mask, pad_right_at_dim_to, masked_mean
+from x_mlps_pytorch import create_mlp
 
 # constants
 
@@ -78,6 +79,7 @@ class MultiHeadDynamicSequenceChunker(Module):
         straight_through_frac_vecs = True,  # improvisation where F receives gradients through straight-through with sigmoid
         add_hier_ar_loss = False,            # "hierarchical autoregressive" loss - just an extra projection at the end and made to predict the next input token
         detach_hier_target = True,
+        embed_chunk_lens = False,
     ):
         super().__init__()
         dim_queries_keys = default(dim_queries_keys, dim)
@@ -149,6 +151,17 @@ class MultiHeadDynamicSequenceChunker(Module):
             self.to_hier_ar_pred = Sequential(
                 RMSNorm(dim),
                 Linear(dim, dim)
+            )
+
+        # length embed
+
+        self.embed_chunk_lens = embed_chunk_lens
+
+        self.length_embed = None
+        if embed_chunk_lens:
+            self.length_embed = Sequential(
+                Rearrange('... -> ... 1'),
+                create_mlp(dim, depth = 2, dim_in = 1, dim_out = dim)
             )
 
         # zero
@@ -356,6 +369,16 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         if not self.heads_merged_with_batch:
             downsampled_tokens = rearrange(downsampled_tokens, '(h b) ... -> h b ...', h = heads)
+
+        # length embed
+
+        if self.embed_chunk_lens:
+            chunk_lens_for_embed = chunk_lens.float()
+            if not self.heads_merged_with_batch:
+                chunk_lens_for_embed = rearrange(chunk_lens_for_embed, '(h b) ... -> h b ...', h = heads)
+
+            length_embeds = self.length_embed(chunk_lens_for_embed)
+            downsampled_tokens = downsampled_tokens + length_embeds
 
         # returning
 

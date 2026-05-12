@@ -4,7 +4,7 @@ from collections import namedtuple
 
 import torch
 from torch import cat, arange, tensor, repeat_interleave
-from torch.nn import Module, Linear, Parameter
+from torch.nn import Module, Linear, Parameter, Sequential
 from torch.nn.functional import cosine_similarity, pad
 from torch.nn.utils.rnn import pad_sequence
 
@@ -14,6 +14,9 @@ from einops import repeat, rearrange
 from assoc_scan import AssocScan
 
 from torch_einops_utils import lens_to_mask, pad_right_at_dim_to, masked_mean
+
+from einops.layers.torch import Rearrange
+from x_mlps_pytorch import create_mlp
 
 # constants
 
@@ -69,6 +72,7 @@ class DynamicSequenceChunker(Module):
         assoc_scan_use_accelerated = False,
         learning_rate_difference = 0.75,    # in the paper, they report that as one moves up a hierarchy, the learning rate needs to decrease. we'll default to 0.75 for the rough 2.0 -> 1.5 somewhere in the appendix from level 0 -> 1
         straight_through_frac_vecs = True,  # improvisation where F receives gradients through straight-through with sigmoid
+        embed_chunk_lens = False,
     ):
         super().__init__()
         dim_queries_keys = default(dim_queries_keys, dim)
@@ -110,6 +114,15 @@ class DynamicSequenceChunker(Module):
         self.straight_through_frac_vecs = straight_through_frac_vecs
 
         self.ratio_loss_weight = ratio_loss_weight
+
+        self.embed_chunk_lens = embed_chunk_lens
+
+        self.length_embed = None
+        if embed_chunk_lens:
+            self.length_embed = Sequential(
+                Rearrange('... -> ... 1'),
+                create_mlp(dim, depth = 2, dim_in = 1, dim_out = dim)
+            )
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -323,6 +336,12 @@ class DynamicSequenceChunker(Module):
         # adjust learning rate
 
         downsampled_tokens = frac_gradient(downsampled_tokens, self.learning_rate_difference ** -1)
+
+        # length embed
+
+        if self.embed_chunk_lens:
+            length_embeds = self.length_embed(chunk_lens.float())
+            downsampled_tokens = downsampled_tokens + length_embeds
 
         # returning
 
