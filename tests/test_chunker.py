@@ -460,3 +460,45 @@ def test_deeply_nested_hnet_cache_parity(batch_size):
 
     sequential_out = torch.cat(sequential_outs, dim = 1)
     assert torch.allclose(parallel_out, sequential_out, atol = 1e-4)
+
+@param('batch_size', (1, 4))
+def test_identity_network_caching(batch_size):
+    import torch
+    from torch import nn
+    from x_transformers import Decoder
+    from h_net_dynamic_chunking import HNet
+
+    dim = 64
+    heads = 1
+    seq_len = 16
+
+    encoder = Decoder(dim = dim, depth = 1, heads = heads)
+    inner_network = nn.Identity()
+    decoder = Decoder(dim = dim, depth = 1, heads = heads)
+
+    hnet = HNet(
+        encoder = encoder,
+        network = inner_network,
+        decoder = decoder,
+        dim = dim,
+        heads = heads,
+    )
+    hnet.eval()
+
+    tokens = torch.randn(batch_size, seq_len, dim)
+
+    with torch.no_grad():
+        parallel_out = hnet(tokens).output
+
+    cache = None
+    sequential_outs = []
+
+    with torch.no_grad():
+        for i in range(seq_len):
+            token = tokens[:, i:i+1]
+            out = hnet(token, cache=cache, return_hiddens=True)
+            cache = out.next_cache
+            sequential_outs.append(out.output)
+
+    sequential_out = torch.cat(sequential_outs, dim = 1)
+    assert torch.allclose(parallel_out, sequential_out, atol = 1e-4)
