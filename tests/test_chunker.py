@@ -304,7 +304,8 @@ def test_inner_network_pos_kwarg():
 
     assert out.output.shape == tokens.shape
 
-def test_hnet_cache_parity():
+@param('batch_size', (1, 2))
+def test_hnet_cache_parity(batch_size):
     import torch
     from x_transformers import Decoder
     from h_net_dynamic_chunking import HNet
@@ -326,7 +327,7 @@ def test_hnet_cache_parity():
     )
     hnet.eval()
 
-    tokens = torch.randn(1, seq_len, dim)
+    tokens = torch.randn(batch_size, seq_len, dim)
 
     with torch.no_grad():
         parallel_out = hnet(tokens).output
@@ -344,7 +345,8 @@ def test_hnet_cache_parity():
     sequential_out = torch.cat(sequential_outs, dim = 1)
     assert torch.allclose(parallel_out, sequential_out, atol = 1e-4)
 
-def test_nested_hnet_cache_parity():
+@param('batch_size', (1, 4))
+def test_nested_hnet_cache_parity(batch_size):
     import torch
     from x_transformers import Decoder
     from h_net_dynamic_chunking import HNet
@@ -376,7 +378,7 @@ def test_nested_hnet_cache_parity():
     )
     hnet.eval()
 
-    tokens = torch.randn(1, seq_len, dim)
+    tokens = torch.randn(batch_size, seq_len, dim)
 
     with torch.no_grad():
         parallel_out = hnet(tokens).output
@@ -394,7 +396,8 @@ def test_nested_hnet_cache_parity():
     sequential_out = torch.cat(sequential_outs, dim = 1)
     assert torch.allclose(parallel_out, sequential_out, atol = 1e-4)
 
-def test_deeply_nested_hnet_cache_parity():
+@param('batch_size', (1, 4))
+def test_deeply_nested_hnet_cache_parity(batch_size):
     import torch
     from x_transformers import Decoder
     from h_net_dynamic_chunking import HNet
@@ -440,7 +443,7 @@ def test_deeply_nested_hnet_cache_parity():
     )
     hnet.eval()
 
-    tokens = torch.randn(1, seq_len, dim)
+    tokens = torch.randn(batch_size, seq_len, dim)
 
     with torch.no_grad():
         parallel_out = hnet(tokens).output

@@ -149,7 +149,17 @@ class DynamicSequenceChunker(Module):
             downsampled = self.smooth_assoc_scan(gates, downsampled, prev = assoc_scan_prev)
 
             if exists(cache):
-                cache['assoc_scan_prev'] = downsampled[:, -1]
+                num_chunks = intermediates.boundary_mask.long().sum(dim = -1)
+                valid_mask = num_chunks > 0
+                last_indices = (num_chunks - 1).clamp(min = 0)
+                last_chunks = downsampled[arange(batch, device = device), last_indices]
+
+                if not exists(assoc_scan_prev):
+                    assoc_scan_prev = torch.zeros_like(last_chunks)
+
+                next_assoc_scan_prev = where('b, b d, b d', valid_mask, last_chunks, assoc_scan_prev)
+
+                cache['assoc_scan_prev'] = next_assoc_scan_prev
 
         # upsample
 
@@ -216,7 +226,11 @@ class DynamicSequenceChunker(Module):
         keys_for_sim = cat((keys_to_prepend, keys[:, :-1]), dim = 1)
 
         if exists(cache):
-            cache['prev_key'] = keys[:, -1:]
+            if exists(lens):
+                has_valid = lens > 0
+                cache['prev_key'] = torch.where(has_valid[:, None, None], keys[:, -1:], keys_to_prepend)
+            else:
+                cache['prev_key'] = keys[:, -1:]
 
         # each query looks at the previous key to determine if distance is greater than some threshold for determining a boundary exists (they use 0.5 as threshold)
 

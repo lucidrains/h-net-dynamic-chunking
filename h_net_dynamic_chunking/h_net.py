@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from collections import namedtuple
 
-import inspect
-
 import torch
 from torch import nn, tensor
 from torch.nn import Module
 from torch.nn.utils.rnn import pad_sequence
 
-from torch_einops_utils import exclusive_cumsum, pad_left_at_dim
+from einops import rearrange
+
+from torch_einops_utils import exclusive_cumsum, lens_to_mask, pad_left_at_dim
 
 from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicSequenceChunker
 from h_net_dynamic_chunking.multi_head_h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
@@ -17,7 +17,6 @@ from h_net_dynamic_chunking.multi_head_h_net_dynamic_chunking import MultiHeadDy
 from vector_quantize_pytorch import VectorQuantize
 
 from x_transformers import Decoder
-from x_transformers.x_transformers import AttentionLayers
 
 # helpers
 
@@ -56,13 +55,30 @@ def calc_absolute_chunk_lens(
 
     return padded_absolute_cumsum[:, 1:] - padded_absolute_cumsum[:, :-1]
 
-# check if a module's forward accepts cache and return_hiddens kwargs
+# cache shifting
+# right-align kv cache for valid entries using stable argsort on boolean mask
 
-def accepts_cache(module):
-    if isinstance(module, (Decoder, AttentionLayers)):
-        return True
-    sig = inspect.signature(module.forward).parameters
-    return 'cache' in sig and ('return_hiddens' in sig or 'kwargs' in sig)
+def shift_mask_right(mask):
+    if not exists(mask):
+        return mask
+    indices = mask.long().argsort(dim = -1, stable = True)
+    return mask.gather(1, indices)
+
+def shift_cache_right(cache, mask):
+    if not exists(mask) or not exists(cache):
+        return cache
+
+    indices = mask.long().argsort(dim = -1, stable = True)
+
+    for attn_inter in cache.attn_intermediates:
+        if not exists(attn_inter.cached_kv):
+            continue
+
+        k, v = attn_inter.cached_kv
+        indices_expanded = rearrange(indices, 'b n -> b 1 n 1').expand_as(k)
+        attn_inter.cached_kv = (k.gather(2, indices_expanded), v.gather(2, indices_expanded))
+
+    return cache
 
 # classes
 
@@ -114,8 +130,7 @@ class HNet(Module):
             **dynamic_sequence_chunking_kwargs
         )
 
-        # convenience, if hierarchical layer should have dimension expansion
-        # would make sense
+        # maybe dimension expansion
 
         dim_inner = default(dim_inner, dim)
         need_proj = dim != dim_inner
@@ -123,8 +138,7 @@ class HNet(Module):
         self.proj_in = nn.Linear(dim, dim_inner) if need_proj else nn.Identity()
         self.proj_out = nn.Linear(dim_inner, dim) if need_proj else nn.Identity()
 
-        # maybe do vector quantization
-        # just use own library
+        # maybe vector quantization
 
         if isinstance(vq, dict):
             vq = VectorQuantize(**vq)
@@ -134,24 +148,8 @@ class HNet(Module):
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
-        # determine cache support for encoder, decoder, and inner network at init time
-
-        is_nested_hnet = isinstance(self.network, HNet)
-        self._is_nested_hnet = is_nested_hnet
-
-        self._encoder_accepts_cache = accepts_cache(self.encoder)
-        self._decoder_accepts_cache = accepts_cache(self.decoder)
-        self._inner_accepts_cache = is_nested_hnet or accepts_cache(self.network)
+        self._is_nested_hnet = isinstance(self.network, HNet)
         self._is_multi_head = heads > 1
-
-        # inner cache kwargs
-
-        inner_sig = inspect.signature(self.network.forward).parameters
-
-        self._inner_cache_kwargs = dict(return_hiddens = True)
-
-        if 'input_not_include_cache' in inner_sig or 'kwargs' in inner_sig:
-            self._inner_cache_kwargs['input_not_include_cache'] = True
 
     @property
     def device(self):
@@ -170,21 +168,50 @@ class HNet(Module):
 
         assert not (self._is_multi_head and is_caching), 'caching is not yet supported for multi-head dynamic sequence chunking'
 
-        # unpack cache, ensuring we don't mutate the user's input cache
+        # unpack cache
 
         next_cache = dict()
 
-        chunker_cache, upsample_cache, encoder_cache, decoder_cache, inner_cache = pick(cache, 'chunker', 'upsample', 'encoder', 'decoder', 'inner')
+        chunker_cache, upsample_cache, encoder_cache, decoder_cache, inner_cache, inner_mask_cache, input_mask_cache = pick(cache, 'chunker', 'upsample', 'encoder', 'decoder', 'inner', 'inner_mask', 'input_mask')
+
+        # input mask for current step
+
+        if exists(lens):
+            curr_input_mask = lens_to_mask(lens, max_len = tokens.shape[1])
+        else:
+            curr_input_mask = torch.ones(tokens.shape[:2], device = tokens.device, dtype = torch.bool)
+
+        # accumulate mask cache and derive positional info
 
         if is_caching:
             chunker_cache = default(chunker_cache, dict())
             upsample_cache = default(upsample_cache, dict())
 
+            if exists(input_mask_cache):
+                enc_seq_start_pos = (~input_mask_cache).sum(dim = -1)
+                input_mask_cache = torch.cat((input_mask_cache, curr_input_mask), dim = -1)
+            else:
+                enc_seq_start_pos = torch.zeros(tokens.shape[0], device = tokens.device, dtype = torch.long)
+                input_mask_cache = curr_input_mask
+
         # encode
 
-        if self._encoder_accepts_cache and is_caching:
-            encoded, encoder_cache = self.encoder(tokens, cache = encoder_cache, return_hiddens = True)
+        if is_caching:
+            assert isinstance(self.encoder, Decoder), 'encoder must be a Decoder when caching'
+
+            encoded, encoder_cache = self.encoder(
+                tokens,
+                mask = curr_input_mask,
+                cache = encoder_cache,
+                return_hiddens = True,
+                self_attn_kv_mask = input_mask_cache,
+                seq_start_pos = enc_seq_start_pos
+            )
+
             next_cache['encoder'] = encoder_cache
+
+        elif isinstance(self.encoder, Decoder):
+            encoded = self.encoder(tokens, mask = curr_input_mask)
         else:
             encoded = self.encoder(tokens)
 
@@ -221,16 +248,16 @@ class HNet(Module):
                 quantized_downsampled_indices = quantized_downsampled_indices
             )
 
-        network_kwargs = dict()
-
         # maybe pass boundary positions to inner network
         # inspired by HealthFormer (https://www.medrxiv.org/content/10.64898/2026.03.25.26349262v1)
 
+        inner_network_extra_kwargs = dict()
+
         if exists(self.inner_network_rel_pos_kwarg):
             boundary_positions = exclusive_cumsum(intermediate.chunk_lens)
-            network_kwargs[self.inner_network_rel_pos_kwarg] = boundary_positions
+            inner_network_extra_kwargs[self.inner_network_rel_pos_kwarg] = boundary_positions
 
-        # inner network - skip if no boundaries this step (cache handles output)
+        # inner network
 
         has_tokens_for_inner = not is_empty(maybe_projected_downsampled)
 
@@ -240,24 +267,49 @@ class HNet(Module):
         if not has_tokens_for_inner:
             inner_network_output = maybe_projected_downsampled
 
-        elif self._is_nested_hnet:
-            inner_lens = (intermediate.chunk_lens > 0).sum(dim=-1)
-            out = self.network(maybe_projected_downsampled, lens = inner_lens, cache = inner_cache, return_hiddens = is_caching, return_intermediates = True)
-
-            inner_network_output = out.output
-            maybe_inner_aux_ratio_loss = out.loss
-            inner_cache = out.next_cache
-            inner_intermediates = out.intermediates
-
         else:
-            if self._inner_accepts_cache and is_caching:
-                inner_kwargs = {**self._inner_cache_kwargs, **network_kwargs}
-                inner_network_output, inner_cache = self.network(maybe_projected_downsampled, cache = inner_cache, **inner_kwargs)
+            curr_inner_mask = intermediate.chunk_lens > 0
+
+            if is_caching:
+                if exists(inner_mask_cache):
+                    inner_seq_start_pos = (~inner_mask_cache).sum(dim = -1)
+                    inner_mask_cache = torch.cat((inner_mask_cache, curr_inner_mask), dim = -1)
+                else:
+                    inner_seq_start_pos = torch.zeros(maybe_projected_downsampled.shape[0], device = tokens.device, dtype = torch.long)
+                    inner_mask_cache = curr_inner_mask
+
+            if self._is_nested_hnet:
+                inner_lens = curr_inner_mask.sum(dim = -1)
+                out = self.network(maybe_projected_downsampled, lens = inner_lens, cache = inner_cache, return_hiddens = is_caching, return_intermediates = True)
+
+                inner_network_output = out.output
+                maybe_inner_aux_ratio_loss = out.loss
+                inner_cache = out.next_cache
+                inner_intermediates = out.intermediates
+
+            elif is_caching:
+                assert isinstance(self.network, Decoder), 'network must be a Decoder when caching'
+
+                inner_network_output, inner_cache = self.network(
+                    maybe_projected_downsampled,
+                    mask = curr_inner_mask,
+                    cache = inner_cache,
+                    return_hiddens = True,
+                    self_attn_kv_mask = inner_mask_cache,
+                    seq_start_pos = inner_seq_start_pos,
+                    input_not_include_cache = True,
+                    **inner_network_extra_kwargs
+                )
+
+            elif isinstance(self.network, Decoder):
+                inner_network_output = self.network(maybe_projected_downsampled, mask = curr_inner_mask, **inner_network_extra_kwargs)
+
             else:
-                inner_network_output = self.network(maybe_projected_downsampled, **network_kwargs)
+                inner_network_output = self.network(maybe_projected_downsampled, **inner_network_extra_kwargs)
 
         if return_hiddens:
             next_cache['inner'] = inner_cache
+            next_cache['inner_mask'] = inner_mask_cache
 
         upsampled = upsample(self.proj_out(inner_network_output), cache = upsample_cache)
 
@@ -268,18 +320,46 @@ class HNet(Module):
 
         # decode
 
-        if self._decoder_accepts_cache and is_caching:
-            output, decoder_cache = self.decoder(upsampled, cache = decoder_cache, return_hiddens = True)
+        if is_caching:
+            assert isinstance(self.decoder, Decoder), 'decoder must be a Decoder when caching'
+
+            output, decoder_cache = self.decoder(
+                upsampled,
+                mask = curr_input_mask,
+                cache = decoder_cache,
+                return_hiddens = True,
+                self_attn_kv_mask = input_mask_cache,
+                seq_start_pos = enc_seq_start_pos
+            )
+
             next_cache['decoder'] = decoder_cache
+
+        elif isinstance(self.decoder, Decoder):
+            output = self.decoder(upsampled, mask = curr_input_mask)
         else:
             output = self.decoder(upsampled)
 
         total_loss = aux_ratio_loss + maybe_inner_aux_ratio_loss + extra_loss + maybe_commit_loss
 
+        # shift caches right-aligned for next step
+
         if return_hiddens:
+            if exists(input_mask_cache):
+                next_cache['encoder'] = shift_cache_right(next_cache.get('encoder'), input_mask_cache)
+                next_cache['decoder'] = shift_cache_right(next_cache.get('decoder'), input_mask_cache)
+                input_mask_cache = shift_mask_right(input_mask_cache)
+
+            if exists(inner_mask_cache):
+                if not self._is_nested_hnet:
+                    next_cache['inner'] = shift_cache_right(next_cache.get('inner'), inner_mask_cache)
+
+                inner_mask_cache = shift_mask_right(inner_mask_cache)
+                next_cache['inner_mask'] = inner_mask_cache
+
             next_cache.update(
                 chunker = chunker_cache,
-                upsample = upsample_cache
+                upsample = upsample_cache,
+                input_mask = input_mask_cache
             )
 
         intermediate_out = intermediate
