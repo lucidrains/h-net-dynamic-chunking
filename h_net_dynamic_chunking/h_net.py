@@ -9,7 +9,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from einops import rearrange
 
-from torch_einops_utils import exclusive_cumsum, lens_to_mask, pad_left_at_dim
+from torch_einops_utils import exclusive_cumsum, lens_to_mask, pad_left_at_dim, maybe
 
 from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicSequenceChunker
 from h_net_dynamic_chunking.multi_head_h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
@@ -58,9 +58,8 @@ def calc_absolute_chunk_lens(
 # cache shifting
 # right-align kv cache for valid entries using stable argsort on boolean mask
 
+@maybe
 def shift_mask_right(mask):
-    if not exists(mask):
-        return mask
     indices = mask.long().argsort(dim = -1, stable = True)
     return mask.gather(1, indices)
 
@@ -70,13 +69,30 @@ def shift_cache_right(cache, mask):
 
     indices = mask.long().argsort(dim = -1, stable = True)
 
+    if isinstance(cache, dict):
+        for k in ('encoder', 'decoder'):
+            if k in cache:
+                cache[k] = shift_cache_right(cache[k], mask)
+
+        if exists(cache.get('input_mask')):
+            cache['input_mask'] = cache['input_mask'].gather(1, indices)
+
+        return cache
+
+    if not hasattr(cache, 'attn_intermediates') or not exists(cache.attn_intermediates):
+        return cache
+
     for attn_inter in cache.attn_intermediates:
         if not exists(attn_inter.cached_kv):
             continue
 
         k, v = attn_inter.cached_kv
         indices_expanded = rearrange(indices, 'b n -> b 1 n 1').expand_as(k)
-        attn_inter.cached_kv = (k.gather(2, indices_expanded), v.gather(2, indices_expanded))
+
+        attn_inter.cached_kv = (
+            k.gather(2, indices_expanded),
+            v.gather(2, indices_expanded)
+        )
 
     return cache
 
@@ -339,14 +355,8 @@ class HNet(Module):
         # shift caches right-aligned for next step
 
         if return_hiddens:
-            if exists(input_mask_cache):
-                next_cache['encoder'] = shift_cache_right(next_cache.get('encoder'), input_mask_cache)
-                next_cache['decoder'] = shift_cache_right(next_cache.get('decoder'), input_mask_cache)
-                input_mask_cache = shift_mask_right(input_mask_cache)
-
             if exists(inner_mask_cache):
-                if not self._is_nested_hnet:
-                    next_cache['inner'] = shift_cache_right(next_cache.get('inner'), inner_mask_cache)
+                next_cache['inner'] = shift_cache_right(next_cache.get('inner'), inner_mask_cache)
 
                 inner_mask_cache = shift_mask_right(inner_mask_cache)
                 next_cache['inner_mask'] = inner_mask_cache
