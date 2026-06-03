@@ -196,9 +196,7 @@ class HNet(Module):
 
         # encode
 
-        if is_caching:
-            assert isinstance(self.encoder, Decoder), 'encoder must be a Decoder when caching'
-
+        if is_caching and isinstance(self.encoder, Decoder):
             encoded, encoder_cache = self.encoder(
                 tokens,
                 mask = curr_input_mask,
@@ -287,8 +285,7 @@ class HNet(Module):
                 inner_cache = out.next_cache
                 inner_intermediates = out.intermediates
 
-            elif is_caching:
-                assert isinstance(self.network, Decoder), 'network must be a Decoder when caching'
+            elif is_caching and isinstance(self.network, Decoder):
 
                 inner_network_output, inner_cache = self.network(
                     maybe_projected_downsampled,
@@ -320,9 +317,7 @@ class HNet(Module):
 
         # decode
 
-        if is_caching:
-            assert isinstance(self.decoder, Decoder), 'decoder must be a Decoder when caching'
-
+        if is_caching and isinstance(self.decoder, Decoder):
             output, decoder_cache = self.decoder(
                 upsampled,
                 mask = curr_input_mask,
