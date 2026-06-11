@@ -18,6 +18,8 @@ from torch_einops_utils import lens_to_mask, pad_right_at_dim_to, masked_mean
 from einops.layers.torch import Rearrange
 from x_mlps_pytorch import create_mlp
 
+from h_net_dynamic_chunking.segmented_attention_pool import SegmentedAttentionPool
+
 # constants
 
 Outputs = namedtuple('Outputs', [
@@ -73,6 +75,7 @@ class DynamicSequenceChunker(Module):
         learning_rate_difference = 0.75,    # in the paper, they report that as one moves up a hierarchy, the learning rate needs to decrease. we'll default to 0.75 for the rough 2.0 -> 1.5 somewhere in the appendix from level 0 -> 1
         straight_through_frac_vecs = True,  # improvisation where F receives gradients through straight-through with sigmoid
         embed_chunk_lens = False,
+        use_attention_pool = False,
     ):
         super().__init__()
         dim_queries_keys = default(dim_queries_keys, dim)
@@ -123,6 +126,11 @@ class DynamicSequenceChunker(Module):
                 Rearrange('... -> ... 1'),
                 create_mlp(dim, depth = 2, dim_in = 1, dim_out = dim)
             )
+
+        # maybe attention pool for downsampling, in place of boundary token picking
+
+        self.use_attention_pool = use_attention_pool
+        self.attn_pool = SegmentedAttentionPool(dim) if use_attention_pool else None
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -275,7 +283,7 @@ class DynamicSequenceChunker(Module):
         if return_only_chunk_lens:
             return chunk_lens
 
-        # downsampling - they show in their experiments that picking out the boundary tokens works just fine
+        # downsampling
 
         max_chunks = num_chunks.amax().item()
 
@@ -284,9 +292,14 @@ class DynamicSequenceChunker(Module):
             gates = probs[:, 0:0]
 
         else:
-            boundary_tokens = tokens[boundary_mask] # pick out boundary tokens
 
-            downsampled_tokens = pad_sequence(boundary_tokens.split(num_chunks.tolist()), batch_first=True, padding_value=0.)
+            # either attention pool over each segment, or pick out boundary tokens
+
+            if self.use_attention_pool:
+                downsampled_tokens = self.attn_pool(tokens, chunk_lens)
+            else:
+                boundary_tokens = tokens[boundary_mask]
+                downsampled_tokens = pad_sequence(boundary_tokens.split(num_chunks.tolist()), batch_first=True, padding_value=0.)
 
             # smoothing module for improved gradients eq(5)
 

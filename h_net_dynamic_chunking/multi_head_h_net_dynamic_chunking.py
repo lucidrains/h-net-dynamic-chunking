@@ -4,7 +4,6 @@ from collections import namedtuple
 
 import torch
 from torch import cat, arange, tensor, repeat_interleave
-from torch.nn.utils.rnn import pad_sequence
 from torch.nn import Module, Linear, Parameter, Sequential, RMSNorm, Identity
 from torch.nn.functional import cosine_similarity, pad
 from torch.nn.utils.rnn import pad_sequence
@@ -15,7 +14,10 @@ from einops.layers.torch import Rearrange, Reduce
 
 from assoc_scan import AssocScan
 from torch_einops_utils import lens_to_mask, pad_right_at_dim_to, masked_mean
+
 from x_mlps_pytorch import create_mlp
+
+from h_net_dynamic_chunking.segmented_attention_pool import SegmentedAttentionPool
 
 # constants
 
@@ -80,6 +82,7 @@ class MultiHeadDynamicSequenceChunker(Module):
         add_hier_ar_loss = False,            # "hierarchical autoregressive" loss - just an extra projection at the end and made to predict the next input token
         detach_hier_target = True,
         embed_chunk_lens = False,
+        use_attention_pool = False,
     ):
         super().__init__()
         dim_queries_keys = default(dim_queries_keys, dim)
@@ -163,6 +166,11 @@ class MultiHeadDynamicSequenceChunker(Module):
                 Rearrange('... -> ... 1'),
                 create_mlp(dim, depth = 2, dim_in = 1, dim_out = dim)
             )
+
+        # maybe attention pool for downsampling, in place of boundary token picking
+
+        self.use_attention_pool = use_attention_pool
+        self.attn_pool = SegmentedAttentionPool(dim) if use_attention_pool else None
 
         # zero
 
@@ -300,9 +308,11 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         tokens = repeat(tokens, 'b ... -> (h b) ...', h = heads)
 
-        boundary_tokens = tokens[boundary_mask] # pick out boundary tokens
-
-        downsampled_tokens = pad_sequence(boundary_tokens.split(num_chunks.tolist()), batch_first=True, padding_value=0.)
+        if self.use_attention_pool:
+            downsampled_tokens = self.attn_pool(tokens, chunk_lens)
+        else:
+            boundary_tokens = tokens[boundary_mask] # pick out boundary tokens
+            downsampled_tokens = pad_sequence(boundary_tokens.split(num_chunks.tolist()), batch_first=True, padding_value=0.)
 
         boundary_probs = pad_sequence(probs[boundary_mask].split(num_chunks.tolist()), batch_first=True, padding_value=0.)
 

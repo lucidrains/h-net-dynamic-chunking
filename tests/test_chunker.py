@@ -5,14 +5,16 @@ param = pytest.mark.parametrize
 @param('handle_residual_proj', (False, True))
 @param('straight_through_frac_vecs', (False, True))
 @param('embed_chunk_lens', (False, True))
+@param('use_attention_pool', (False, True))
 def test_chunker(
     handle_residual_proj,
     straight_through_frac_vecs,
-    embed_chunk_lens
+    embed_chunk_lens,
+    use_attention_pool
 ):
     from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicSequenceChunker
 
-    downsampler = DynamicSequenceChunker(512, handle_residual_proj = handle_residual_proj, straight_through_frac_vecs = straight_through_frac_vecs, embed_chunk_lens = embed_chunk_lens)
+    downsampler = DynamicSequenceChunker(512, handle_residual_proj = handle_residual_proj, straight_through_frac_vecs = straight_through_frac_vecs, embed_chunk_lens = embed_chunk_lens, use_attention_pool = use_attention_pool)
 
     tokens = torch.randn(3, 1024, 512).requires_grad_()
 
@@ -25,16 +27,18 @@ def test_chunker(
 @param('has_lens', (False, True))
 @param('handle_residual_proj', (False, True))
 @param('embed_chunk_lens', (False, True))
+@param('use_attention_pool', (False, True))
 def test_chunker_with_lens(
     has_lens,
     handle_residual_proj,
-    embed_chunk_lens
+    embed_chunk_lens,
+    use_attention_pool
 ):
     from h_net_dynamic_chunking.h_net_dynamic_chunking import DynamicSequenceChunker
 
     batch, max_len, dim = 4, 64, 128
 
-    downsampler = DynamicSequenceChunker(dim, handle_residual_proj = handle_residual_proj, embed_chunk_lens = embed_chunk_lens)
+    downsampler = DynamicSequenceChunker(dim, handle_residual_proj = handle_residual_proj, embed_chunk_lens = embed_chunk_lens, use_attention_pool = use_attention_pool)
 
     tokens = torch.randn(batch, max_len, dim).requires_grad_()
 
@@ -101,16 +105,18 @@ def test_hnet():
 @param('has_lens', (False, True))
 @param('handle_residual_proj', (False, True))
 @param('embed_chunk_lens', (False, True))
+@param('use_attention_pool', (False, True))
 def test_multihead_chunker_with_lens(
     has_lens,
     handle_residual_proj,
-    embed_chunk_lens
+    embed_chunk_lens,
+    use_attention_pool
 ):
     from h_net_dynamic_chunking.multi_head_h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
 
     batch, max_len, dim, heads = 4, 64, 128, 4
 
-    downsampler = MultiHeadDynamicSequenceChunker(dim, heads=heads, handle_residual_proj=handle_residual_proj, embed_chunk_lens=embed_chunk_lens)
+    downsampler = MultiHeadDynamicSequenceChunker(dim, heads=heads, handle_residual_proj=handle_residual_proj, embed_chunk_lens=embed_chunk_lens, use_attention_pool=use_attention_pool)
 
     tokens = torch.randn(batch, max_len, dim).requires_grad_()
 
@@ -502,3 +508,35 @@ def test_identity_network_caching(batch_size):
 
     sequential_out = torch.cat(sequential_outs, dim = 1)
     assert torch.allclose(parallel_out, sequential_out, atol = 1e-4)
+
+def test_segmented_attention_pool():
+    from h_net_dynamic_chunking import SegmentedAttentionPool
+
+    dim = 16
+    pool = SegmentedAttentionPool(dim)
+
+    tokens = torch.randn(2, 6, dim)
+    chunk_lens = torch.tensor([[2, 3, 0], [1, 2, 2]])
+
+    fast = pool(tokens, chunk_lens)
+
+    manual_batches = []
+
+    for batch_tokens, batch_lens in zip(tokens, chunk_lens.tolist()):
+        chunks = batch_tokens[:sum(batch_lens)].split(batch_lens)
+
+        manual_chunks = []
+
+        for chunk in chunks:
+            if chunk.numel() == 0:
+                manual_chunks.append(torch.zeros(dim))
+                continue
+
+            attn = pool.to_attn_logits(chunk).softmax(dim = 0)
+            manual_chunks.append((chunk * attn).sum(dim = 0))
+
+        manual_batches.append(torch.stack(manual_chunks))
+
+    manual = torch.stack(manual_batches)
+
+    assert torch.allclose(fast, manual, atol = 1e-5)
