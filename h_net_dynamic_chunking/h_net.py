@@ -105,6 +105,14 @@ HNetReturn = namedtuple('HNetReturn', [
     'next_cache'
 ])
 
+HNetReturnWithLatentAR = namedtuple('HNetReturnWithLatentAR', [
+    'output',
+    'loss',
+    'intermediates',
+    'next_cache',
+    'latent_ar_loss'
+])
+
 class HNet(Module):
     def __init__(
         self,
@@ -115,6 +123,8 @@ class HNet(Module):
         dim_inner = None,
         vq: VectorQuantize | dict | None = None,
         inner_network_rel_pos_kwarg: str | None = None,
+        latent_ar_loss: Module | dict | bool | None = None,
+        protect_latent_ar_loss: bool = True,
         **dynamic_sequence_chunking_kwargs
     ):
         super().__init__()
@@ -161,6 +171,18 @@ class HNet(Module):
 
         assert not exists(vq) or isinstance(vq, VectorQuantize)
         self.vq = vq
+
+        # hierarchical latent ar loss
+
+        if isinstance(latent_ar_loss, bool) and latent_ar_loss:
+            latent_ar_loss = dict()
+
+        if isinstance(latent_ar_loss, dict):
+            from h_net_dynamic_chunking.latent_autoregression import LatentAutoregressiveLoss
+            latent_ar_loss = LatentAutoregressiveLoss(dim = dim_inner, **latent_ar_loss)
+
+        self.latent_ar_loss = latent_ar_loss
+        self.protect_latent_ar_loss = protect_latent_ar_loss
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -320,6 +342,24 @@ class HNet(Module):
             else:
                 inner_network_output = self.network(maybe_projected_downsampled, **inner_network_extra_kwargs)
 
+        maybe_latent_ar_loss = None
+
+        if exists(self.latent_ar_loss) and has_tokens_for_inner:
+            ar_loss, sigreg_loss, _ = self.latent_ar_loss(inner_network_output, mask = curr_inner_mask)
+
+            maybe_latent_ar_loss = ar_loss + sigreg_loss
+
+            if self.protect_latent_ar_loss:
+                from h_net_dynamic_chunking.latent_autoregression import RestrictedBackwardLoss
+
+                # protect the inner network and latent ar loss from receiving gradients from other losses
+                # and prevent the latent ar loss from flowing into the encoder
+
+                maybe_latent_ar_loss = RestrictedBackwardLoss(
+                    maybe_latent_ar_loss,
+                    modules = (self.network, self.latent_ar_loss)
+                )
+
         if return_hiddens:
             next_cache['inner'] = inner_cache
             next_cache['inner_mask'] = inner_mask_cache
@@ -380,9 +420,14 @@ class HNet(Module):
 
             intermediate_out = (intermediate_out, *new_inner_intermediates)
 
-        return HNetReturn(
-            output,
-            total_loss,
-            intermediate_out if return_intermediates else None,
-            next_cache if return_hiddens else None
+        ret_kwargs = dict(
+            output = output,
+            loss = total_loss,
+            intermediates = intermediate_out if return_intermediates else None,
+            next_cache = next_cache if return_hiddens else None
         )
+
+        if exists(maybe_latent_ar_loss):
+            return HNetReturnWithLatentAR(**ret_kwargs, latent_ar_loss = maybe_latent_ar_loss)
+
+        return HNetReturn(**ret_kwargs)

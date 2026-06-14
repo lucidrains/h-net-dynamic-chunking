@@ -115,3 +115,15 @@ $ python train.py
     url     = {https://arxiv.org/abs/2507.07955},
 }
 ```
+
+```bibtex
+@misc{balestriero2025lejepa,
+    title   = {LeJEPA: Provable and Scalable Self-Supervised Learning Without the Heuristics},
+    author  = {Randall Balestriero and Yann LeCun},
+    year    = {2025},
+    eprint  = {2511.08544},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2511.08544},
+}
+```

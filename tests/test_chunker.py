@@ -540,3 +540,33 @@ def test_segmented_attention_pool():
     manual = torch.stack(manual_batches)
 
     assert torch.allclose(fast, manual, atol = 1e-5)
+
+def test_latent_autoregression():
+    from x_transformers import Decoder
+    from h_net_dynamic_chunking.h_net import HNet
+
+    dim = 256
+
+    hnet = HNet(
+        encoder = Decoder(dim = dim, depth = 1, heads = 4),
+        network = Decoder(dim = dim, depth = 2, heads = 4),
+        decoder = Decoder(dim = dim, depth = 1, heads = 4),
+        dim = dim,
+        latent_ar_loss = True
+    )
+
+    tokens = torch.randn(2, 128, dim)
+    out = hnet(tokens)
+
+    assert out.latent_ar_loss is not None, 'latent ar loss must be returned'
+
+    out.latent_ar_loss.backward()
+
+    def has_grads(module):
+        return any(p.grad is not None and p.grad.abs().max() > 0 for p in module.parameters())
+
+    assert not has_grads(hnet.encoder)
+    assert not has_grads(hnet.decoder)
+
+    assert has_grads(hnet.network)
+    assert has_grads(hnet.latent_ar_loss)
