@@ -570,3 +570,198 @@ def test_latent_autoregression():
 
     assert has_grads(hnet.network)
     assert has_grads(hnet.latent_ar_loss)
+
+def test_hnet_multihead():
+    from x_transformers import Decoder
+    from h_net_dynamic_chunking.h_net import HNet
+
+    dim = 64
+    heads = 2
+    seq_len = 16
+
+    hnet = HNet(
+        encoder = Decoder(dim = dim, depth = 1, heads = heads),
+        network = Decoder(dim = dim, depth = 1, heads = heads),
+        decoder = Decoder(dim = dim, depth = 1, heads = heads),
+        dim = dim,
+        heads = heads,
+    )
+
+    tokens = torch.randn(2, seq_len, dim, requires_grad = True)
+    out = hnet(tokens)
+
+    assert out.output.shape == tokens.shape
+    (out.output.sum() + out.loss).backward()
+    assert tokens.grad is not None
+
+def test_hnet_multihead_vq():
+    from x_transformers import Decoder
+    from h_net_dynamic_chunking.h_net import HNet
+
+    dim = 64
+    heads = 2
+    seq_len = 16
+
+    hnet = HNet(
+        encoder = Decoder(dim = dim, depth = 1, heads = heads),
+        network = Decoder(dim = dim, depth = 1, heads = heads),
+        decoder = Decoder(dim = dim, depth = 1, heads = heads),
+        dim = dim,
+        heads = heads,
+        vq = dict(dim = dim, codebook_size = 64)
+    )
+
+    tokens = torch.randn(2, seq_len, dim, requires_grad = True)
+    out = hnet(tokens, return_intermediates = True)
+
+    assert out.output.shape == tokens.shape
+    assert out.intermediates.quantized_downsampled_indices is not None
+    assert out.intermediates.quantized_downsampled_indices.shape[:2] == out.intermediates.input_downsampled_tokens.shape[:2]
+    (out.output.sum() + out.loss).backward()
+    assert tokens.grad is not None
+
+def test_multihead_chunker_hier_ar_loss_short_seq():
+    from h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
+
+    downsampler = MultiHeadDynamicSequenceChunker(64, heads = 2, add_hier_ar_loss = True)
+    tokens = torch.randn(2, 1, 64)
+    downsampled, upsample_fn, aux_loss = downsampler(tokens)
+    upsampled, hier_ar_loss = upsample_fn(downsampled)
+
+    assert not torch.isnan(hier_ar_loss)
+    assert hier_ar_loss.item() == 0.
+
+def test_multihead_chunker_zero_chunks():
+    from h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
+
+    downsampler = MultiHeadDynamicSequenceChunker(64, heads = 2)
+    tokens = torch.randn(2, 10, 64)
+    lens = torch.tensor([0, 0])
+    downsampled, upsample_fn, aux_loss = downsampler(tokens, lens = lens)
+
+    assert downsampled.shape[1] == 0
+    upsampled = upsample_fn(downsampled)
+    assert upsampled.shape == tokens.shape
+
+def test_multihead_chunker_cache_parity():
+    from h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
+
+    torch.manual_seed(0)
+    dim = 64
+    heads = 2
+    seq_len = 16
+    batch_size = 2
+
+    chunker = MultiHeadDynamicSequenceChunker(dim, heads = heads, handle_residual_proj = True)
+    chunker.eval()
+
+    tokens = torch.randn(batch_size, seq_len, dim)
+
+    with torch.no_grad():
+        downsampled_par, upsample_par, _ = chunker(tokens)
+        out_par = upsample_par(downsampled_par)
+
+    cache = dict()
+    sequential_outs = []
+    with torch.no_grad():
+        for i in range(seq_len):
+            token = tokens[:, i:i+1]
+            downsampled_seq, upsample_seq, _ = chunker(token, cache = cache)
+            out_seq = upsample_seq(downsampled_seq, cache = cache)
+            sequential_outs.append(out_seq)
+
+    sequential_out = torch.cat(sequential_outs, dim = 1)
+    assert torch.allclose(out_par, sequential_out, atol = 1e-4)
+
+@param('batch_size', (1, 2))
+def test_hnet_multihead_cache_parity(batch_size):
+    from x_transformers import Decoder
+    from h_net_dynamic_chunking.h_net import HNet
+
+    torch.manual_seed(0)
+    dim = 64
+    heads = 2
+    seq_len = 16
+
+    encoder = Decoder(dim = dim, depth = 1, heads = heads)
+    inner_network = Decoder(dim = dim, depth = 2, heads = heads)
+    decoder = Decoder(dim = dim, depth = 1, heads = heads)
+
+    hnet = HNet(
+        encoder = encoder,
+        network = inner_network,
+        decoder = decoder,
+        dim = dim,
+        heads = heads,
+    )
+    hnet.eval()
+
+    tokens = torch.randn(batch_size, seq_len, dim)
+
+    with torch.no_grad():
+        parallel_out = hnet(tokens).output
+
+    cache = None
+    sequential_outs = []
+
+    with torch.no_grad():
+        for i in range(seq_len):
+            token = tokens[:, i:i+1]
+            out = hnet(token, cache = cache, return_hiddens = True)
+            cache = out.next_cache
+            sequential_outs.append(out.output)
+
+    sequential_out = torch.cat(sequential_outs, dim = 1)
+    assert torch.allclose(parallel_out, sequential_out, atol = 1e-4)
+
+def test_nested_multihead_hnet_cache_parity():
+    from x_transformers import Decoder
+    from h_net_dynamic_chunking.h_net import HNet
+
+    torch.manual_seed(0)
+    dim = 64
+    heads = 2
+    seq_len = 16
+    batch_size = 2
+
+    inner_encoder = Decoder(dim = dim, depth = 1, heads = heads)
+    inner_network = Decoder(dim = dim, depth = 1, heads = heads)
+    inner_decoder = Decoder(dim = dim, depth = 1, heads = heads)
+
+    inner_hnet = HNet(
+        encoder = inner_encoder,
+        network = inner_network,
+        decoder = inner_decoder,
+        dim = dim,
+        heads = heads,
+    )
+
+    outer_encoder = Decoder(dim = dim, depth = 1, heads = heads)
+    outer_decoder = Decoder(dim = dim, depth = 1, heads = heads)
+
+    hnet = HNet(
+        encoder = outer_encoder,
+        network = inner_hnet,
+        decoder = outer_decoder,
+        dim = dim,
+        heads = heads,
+    )
+    hnet.eval()
+
+    tokens = torch.randn(batch_size, seq_len, dim)
+
+    with torch.no_grad():
+        parallel_out = hnet(tokens).output
+
+    cache = None
+    sequential_outs = []
+
+    with torch.no_grad():
+        for i in range(seq_len):
+            token = tokens[:, i:i+1]
+            out = hnet(token, cache = cache, return_hiddens = True)
+            cache = out.next_cache
+            sequential_outs.append(out.output)
+
+    sequential_out = torch.cat(sequential_outs, dim = 1)
+    assert torch.allclose(parallel_out, sequential_out, atol = 1e-4)

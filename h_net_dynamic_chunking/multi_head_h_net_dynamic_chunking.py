@@ -3,17 +3,17 @@
 from collections import namedtuple
 
 import torch
-from torch import cat, arange, tensor, repeat_interleave
+from torch import cat, arange, tensor
 from torch.nn import Module, Linear, Parameter, Sequential, RMSNorm, Identity
 from torch.nn.functional import cosine_similarity, pad
 from torch.nn.utils.rnn import pad_sequence
 
-from einx import multiply
+from einx import multiply, where
 from einops import repeat, rearrange
 from einops.layers.torch import Rearrange, Reduce
 
 from assoc_scan import AssocScan
-from torch_einops_utils import lens_to_mask, pad_right_at_dim_to, masked_mean
+from torch_einops_utils import lens_to_mask, masked_mean
 
 from x_mlps_pytorch import create_mlp
 
@@ -180,45 +180,78 @@ class MultiHeadDynamicSequenceChunker(Module):
         self,
         downsampled,
         intermediates: Intermediates,
-        apply_scale = True
+        apply_scale = True,
+        cache = None
     ):
-
         # split the heads back out if needed
 
         if not self.heads_merged_with_batch:
             downsampled = rearrange(downsampled, 'h b ... -> (h b) ...', h = self.heads)
 
-        batch, needs_grad, device = downsampled.shape[0], downsampled.requires_grad, downsampled.device
+        batch, downsampled_len, dim = downsampled.shape
+        needs_grad, device = downsampled.requires_grad, downsampled.device
 
         mask = intermediates.mask
         gates = intermediates.gates
         residual = intermediates.residual
+        seq_len = residual.shape[1]
 
         # handle maybe hierarchical autoregressive loss
 
         if self.add_hier_ar_loss:
-
-            hier_pred = self.to_hier_ar_pred(downsampled[:, :-1])
-            hier_target = intermediates.input_downsampled_tokens[:, 1:]
             hier_pred_mask = mask[:, 1:]
 
-            maybe_detach = torch.detach if self.detach_hier_target else identity
+            if hier_pred_mask.sum() == 0:
+                ar_loss = self.zero
+            else:
+                hier_pred = self.to_hier_ar_pred(downsampled[:, :-1])
+                hier_target = intermediates.input_downsampled_tokens[:, 1:]
 
-            ar_loss = 1. - cosine_similarity(hier_pred, maybe_detach(hier_target), dim = -1)
+                maybe_detach = torch.detach if self.detach_hier_target else identity
 
-            ar_loss = ar_loss[hier_pred_mask].mean()
+                ar_loss = 1. - cosine_similarity(hier_pred, maybe_detach(hier_target), dim = -1)
+
+                ar_loss = ar_loss[hier_pred_mask].mean()
 
         # smoothing module for improved gradients eq(5)
 
-        downsampled = self.smooth_assoc_scan(gates, downsampled)
+        has_downsampled = downsampled_len > 0
 
-        # get the mask and residual from downsample steps
+        if has_downsampled:
+            assoc_scan_prev = cache.pop('assoc_scan_prev', None) if exists(cache) else None
 
-        upsampled_flat = repeat_interleave(downsampled[mask], intermediates.chunk_lens[mask], dim = 0)
-        effective_lens = intermediates.chunk_lens.sum(dim = -1)
-        upsampled = pad_sequence(upsampled_flat.split(effective_lens.tolist()), batch_first = True, padding_value = 0.)
+            downsampled = self.smooth_assoc_scan(gates, downsampled, prev = assoc_scan_prev)
 
-        upsampled = pad_right_at_dim_to(upsampled, residual.shape[1], dim = 1)
+            if exists(cache):
+                num_chunks = intermediates.boundary_mask.long().sum(dim = -1)
+                valid_mask = num_chunks > 0
+                last_indices = (num_chunks - 1).clamp(min = 0)
+                last_chunks = downsampled[arange(batch, device = device), last_indices]
+
+                if not exists(assoc_scan_prev):
+                    assoc_scan_prev = torch.zeros_like(last_chunks)
+
+                next_assoc_scan_prev = where('b, b d, b d', valid_mask, last_chunks, assoc_scan_prev)
+
+                cache['assoc_scan_prev'] = next_assoc_scan_prev
+
+        # upsample
+
+        last_upsampled = cache.pop('last_upsampled', None) if exists(cache) else None
+        prev_chunk = default(last_upsampled, downsampled.new_zeros(batch, dim))
+
+        downsampled_with_prev = cat((rearrange(prev_chunk, 'b d -> b 1 d'), downsampled), dim = 1)
+        indices = intermediates.boundary_mask.long().cumsum(dim = -1)
+
+        upsampled = downsampled_with_prev[arange(batch, device = device)[:, None], indices]
+
+        if exists(cache):
+            cache['last_upsampled'] = upsampled[:, -1]
+        else:
+            effective_lens = intermediates.chunk_lens.sum(dim = -1)
+            if (effective_lens < seq_len).any():
+                seq_mask = lens_to_mask(effective_lens, max_len = seq_len)
+                upsampled = upsampled.masked_fill(~seq_mask[..., None], 0.)
 
         scale = intermediates.upsampler_output_scale
 
@@ -244,7 +277,8 @@ class MultiHeadDynamicSequenceChunker(Module):
         tokens, # float[b n d],
         lens = None,
         return_intermediates = False,
-        return_only_chunk_lens = False
+        return_only_chunk_lens = False,
+        cache = None
     ):
         batch, length, device, heads = *tokens.shape[:2], tokens.device, self.heads
 
@@ -262,22 +296,37 @@ class MultiHeadDynamicSequenceChunker(Module):
         keys = rearrange(keys, 'h b ... -> (h b) ...')
         start_keys = rearrange(start_keys, 'h b ... -> (h b) ...')
 
-        # concat first key
+        is_first_step = not exists(cache) or 'prev_key' not in cache
 
-        keys = cat((start_keys, keys), dim = 1)
+        if is_first_step:
+            keys_to_prepend = start_keys
+        else:
+            keys_to_prepend = cache.pop('prev_key')
+
+        keys_for_sim = cat((keys_to_prepend, keys[:, :-1]), dim = 1)
+
+        if exists(lens):
+            lens = repeat(lens, 'b -> (h b)', h = heads)
+
+        if exists(cache):
+            if exists(lens):
+                has_valid = lens > 0
+                cache['prev_key'] = torch.where(has_valid[:, None, None], keys[:, -1:], keys_to_prepend)
+            else:
+                cache['prev_key'] = keys[:, -1:]
 
         # each query looks at the previous key to determine if distance is greater than some threshold for determining a boundary exists (they use 0.5 as threshold)
 
-        cosine_sim  = cosine_similarity(queries, keys[:, :-1], dim = -1)
+        cosine_sim  = cosine_similarity(queries, keys_for_sim, dim = -1)
 
         probs = (1. - cosine_sim) * 0.5 # cosine sim is -1. to 1., this transforms it to 0. to 1.
 
         boundary_mask = probs > self.boundary_threshold # bool[b n]
 
-        boundary_mask[:, 0] = True # first token must always be boundary
+        if is_first_step:
+            boundary_mask[:, 0] = True # first token must always be boundary
 
         if exists(lens):
-            lens = repeat(lens, 'b -> (h b)', h = heads)
             seq_mask = lens_to_mask(lens, max_len = length)
             boundary_mask = boundary_mask & seq_mask
 
@@ -292,7 +341,7 @@ class MultiHeadDynamicSequenceChunker(Module):
             boundary_mask_with_end = pad(boundary_mask, (0, 1), value = True)
 
         sel_indices = boundary_mask_with_end.nonzero()[:, 1]
-        sel_indices = pad_sequence(sel_indices.split((num_chunks + 1).tolist()), batch_first=True, padding_value=-1)
+        sel_indices = pad_sequence(sel_indices.split((num_chunks + 1).tolist()), batch_first = True, padding_value = -1)
 
         mask = (sel_indices != -1)[:, 1:]
 
@@ -308,17 +357,23 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         tokens = repeat(tokens, 'b ... -> (h b) ...', h = heads)
 
-        if self.use_attention_pool:
-            downsampled_tokens = self.attn_pool(tokens, chunk_lens)
+        max_chunks = num_chunks.amax().item()
+
+        if max_chunks == 0:
+            downsampled_tokens = tokens[:, 0:0]
+            gates = probs[:, 0:0]
         else:
-            boundary_tokens = tokens[boundary_mask] # pick out boundary tokens
-            downsampled_tokens = pad_sequence(boundary_tokens.split(num_chunks.tolist()), batch_first=True, padding_value=0.)
+            if self.use_attention_pool:
+                downsampled_tokens = self.attn_pool(tokens, chunk_lens)
+            else:
+                boundary_tokens = tokens[boundary_mask] # pick out boundary tokens
+                downsampled_tokens = pad_sequence(boundary_tokens.split(num_chunks.tolist()), batch_first=True, padding_value=0.)
 
-        boundary_probs = pad_sequence(probs[boundary_mask].split(num_chunks.tolist()), batch_first=True, padding_value=0.)
+            boundary_probs = pad_sequence(probs[boundary_mask].split(num_chunks.tolist()), batch_first=True, padding_value=0.)
 
-        gates = 1. - boundary_probs
+            gates = 1. - boundary_probs
 
-        downsampled_tokens = multiply('b n d, b n', downsampled_tokens, boundary_probs)
+            downsampled_tokens = multiply('b n d, b n', downsampled_tokens, boundary_probs)
 
         # for the upsampler
 
@@ -367,9 +422,9 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         # return the upsample function
 
-        def upsample(downsampled, apply_scale = True):
+        def upsample(downsampled, apply_scale = True, cache = None):
 
-            return self.upsample(downsampled, intermediates, apply_scale = apply_scale)
+            return self.upsample(downsampled, intermediates, apply_scale = apply_scale, cache = cache)
 
         # adjust learning rate
 

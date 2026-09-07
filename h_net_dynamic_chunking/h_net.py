@@ -7,7 +7,7 @@ from torch import nn, tensor
 from torch.nn import Module
 from torch.nn.utils.rnn import pad_sequence
 
-from einops import rearrange
+from einops import rearrange, repeat
 
 from torch_einops_utils import exclusive_cumsum, lens_to_mask, pad_left_at_dim, maybe
 
@@ -40,11 +40,18 @@ def calc_absolute_chunk_lens(
     outer_absolute_lens, # int[b n]
     inner_chunk_lens     # int[b m]
 ):
+    outer_batch, inner_batch = outer_absolute_lens.shape[0], inner_chunk_lens.shape[0]
+
+    if outer_batch != inner_batch:
+        heads_ratio = inner_batch // outer_batch
+        outer_absolute_lens = repeat(outer_absolute_lens, 'b ... -> (h b) ...', h = heads_ratio)
+
     outer_cumsum = outer_absolute_lens.cumsum(dim = -1)
 
     padded_outer_cumsum = pad_left_at_dim(outer_cumsum, 1, value = 0)
+    padded_outer_cumsum_len = padded_outer_cumsum.shape[-1]
 
-    max_inner_cumsum = padded_outer_cumsum.shape[-1] - 1
+    max_inner_cumsum = padded_outer_cumsum_len - 1
 
     inner_cumsum = inner_chunk_lens.cumsum(dim = -1)
     inner_cumsum = inner_cumsum.clamp(max = max_inner_cumsum)
@@ -202,9 +209,9 @@ class HNet(Module):
         cache = None,
         vq_mask = None
     ):
-        is_caching = exists(cache) or return_hiddens
+        batch, seq_len, device = *tokens.shape[:2], tokens.device
 
-        assert not (self._is_multi_head and is_caching), 'caching is not yet supported for multi-head dynamic sequence chunking'
+        is_caching = exists(cache) or return_hiddens
 
         # unpack cache
 
@@ -215,9 +222,9 @@ class HNet(Module):
         # input mask for current step
 
         if exists(lens):
-            curr_input_mask = lens_to_mask(lens, max_len = tokens.shape[1])
+            curr_input_mask = lens_to_mask(lens, max_len = seq_len)
         else:
-            curr_input_mask = torch.ones(tokens.shape[:2], device = tokens.device, dtype = torch.bool)
+            curr_input_mask = torch.ones((batch, seq_len), device = device, dtype = torch.bool)
 
         # accumulate mask cache and derive positional info
 
@@ -229,7 +236,7 @@ class HNet(Module):
                 enc_seq_start_pos = (~input_mask_cache).sum(dim = -1)
                 input_mask_cache = torch.cat((input_mask_cache, curr_input_mask), dim = -1)
             else:
-                enc_seq_start_pos = torch.zeros(tokens.shape[0], device = tokens.device, dtype = torch.long)
+                enc_seq_start_pos = torch.zeros(batch, device = device, dtype = torch.long)
                 input_mask_cache = curr_input_mask
 
         # encode
@@ -268,16 +275,17 @@ class HNet(Module):
         )
 
         maybe_projected_downsampled = self.proj_in(downsampled)
+        downsampled_batch = maybe_projected_downsampled.shape[0]
 
         if exists(self.vq):
-            batch = maybe_projected_downsampled.shape[0]
             has_chunks = not is_empty(maybe_projected_downsampled)
 
-            quantized_downsampled_indices = torch.empty((batch, 0), dtype = torch.long, device = self.device)
+            quantized_downsampled_indices = torch.empty((downsampled_batch, 0), dtype = torch.long, device = self.device)
 
             if has_chunks:
                 num_chunks = intermediate.boundary_mask.long().sum(dim = -1)
-                boundary_indices = indices[intermediate.boundary_mask]
+                vq_indices = repeat(indices, 'b ... -> (h b) ...', h = self.dynamic_sequence_chunker.heads) if self._is_multi_head else indices
+                boundary_indices = vq_indices[intermediate.boundary_mask]
                 quantized_downsampled_indices = pad_sequence(boundary_indices.split(num_chunks.tolist()), batch_first = True, padding_value = -1)
 
             intermediate = intermediate._replace(
@@ -311,7 +319,7 @@ class HNet(Module):
                     inner_seq_start_pos = (~inner_mask_cache).sum(dim = -1)
                     inner_mask_cache = torch.cat((inner_mask_cache, curr_inner_mask), dim = -1)
                 else:
-                    inner_seq_start_pos = torch.zeros(maybe_projected_downsampled.shape[0], device = tokens.device, dtype = torch.long)
+                    inner_seq_start_pos = torch.zeros(downsampled_batch, device = device, dtype = torch.long)
                     inner_mask_cache = curr_inner_mask
 
             if self._is_nested_hnet:

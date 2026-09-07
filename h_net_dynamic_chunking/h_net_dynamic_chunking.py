@@ -3,7 +3,7 @@
 from collections import namedtuple
 
 import torch
-from torch import cat, arange, tensor, repeat_interleave
+from torch import cat, arange, tensor
 from torch.nn import Module, Linear, Parameter, Sequential
 from torch.nn.functional import cosine_similarity, pad
 from torch.nn.utils.rnn import pad_sequence
@@ -13,7 +13,7 @@ from einops import repeat, rearrange
 
 from assoc_scan import AssocScan
 
-from torch_einops_utils import lens_to_mask, pad_right_at_dim_to, masked_mean
+from torch_einops_utils import lens_to_mask, masked_mean
 
 from einops.layers.torch import Rearrange
 from x_mlps_pytorch import create_mlp
@@ -141,15 +141,17 @@ class DynamicSequenceChunker(Module):
         apply_scale = True,
         cache = None
     ):
-        batch, needs_grad, device = downsampled.shape[0], downsampled.requires_grad, downsampled.device
+        batch, downsampled_len, dim = downsampled.shape
+        needs_grad, device = downsampled.requires_grad, downsampled.device
 
         mask = intermediates.mask
         gates = intermediates.gates
         residual = intermediates.residual
+        seq_len = residual.shape[1]
 
         # smoothing module for improved gradients eq(5)
 
-        has_downsampled = downsampled.shape[1] > 0
+        has_downsampled = downsampled_len > 0
 
         if has_downsampled:
             assoc_scan_prev = cache.pop('assoc_scan_prev', None) if exists(cache) else None
@@ -171,32 +173,21 @@ class DynamicSequenceChunker(Module):
 
         # upsample
 
+        last_upsampled = cache.pop('last_upsampled', None) if exists(cache) else None
+        prev_chunk = default(last_upsampled, downsampled.new_zeros(batch, dim))
+
+        downsampled_with_prev = cat((rearrange(prev_chunk, 'b d -> b 1 d'), downsampled), dim = 1)
+        indices = intermediates.boundary_mask.long().cumsum(dim = -1)
+
+        upsampled = downsampled_with_prev[arange(batch, device = device)[:, None], indices]
+
         if exists(cache):
-            seq_len = intermediates.boundary_mask.shape[1]
-            last_upsampled = cache.pop('last_upsampled', None)
-
-            if has_downsampled:
-                chunk_idx = intermediates.boundary_mask.long().cumsum(dim = -1) - 1
-
-                upsampled = downsampled[arange(batch, device = device)[:, None], chunk_idx.clamp(min = 0)]
-
-                if exists(last_upsampled):
-                    upsampled = where('b n, b d, b n d', chunk_idx < 0, last_upsampled, upsampled)
-
-            else:
-                assert exists(last_upsampled), 'first token must always be a boundary, so last_upsampled should exist'
-                upsampled = repeat(last_upsampled, 'b d -> b n d', n = seq_len)
-
             cache['last_upsampled'] = upsampled[:, -1]
-
         else:
-            upsampled_flat = repeat_interleave(downsampled[mask], intermediates.chunk_lens[mask], dim = 0)
             effective_lens = intermediates.chunk_lens.sum(dim = -1)
-            upsampled = pad_sequence(upsampled_flat.split(effective_lens.tolist()), batch_first = True, padding_value = 0.)
-
-            # pad to original sequence length if needed (variable lengths)
-
-            upsampled = pad_right_at_dim_to(upsampled, residual.shape[1], dim = 1)
+            if (effective_lens < seq_len).any():
+                seq_mask = lens_to_mask(effective_lens, max_len = seq_len)
+                upsampled = upsampled.masked_fill(~seq_mask[..., None], 0.)
 
         scale = intermediates.upsampler_output_scale
 
