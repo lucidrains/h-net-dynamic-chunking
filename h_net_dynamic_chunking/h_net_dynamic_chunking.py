@@ -156,6 +156,8 @@ class DynamicSequenceChunker(Module):
         if has_downsampled:
             assoc_scan_prev = cache.pop('assoc_scan_prev', None) if exists(cache) else None
 
+            downsampled = multiply('b n d, b n', downsampled, 1. - gates)
+
             downsampled = self.smooth_assoc_scan(gates, downsampled, prev = assoc_scan_prev)
 
             if exists(cache):
@@ -297,8 +299,6 @@ class DynamicSequenceChunker(Module):
             boundary_probs = pad_sequence(probs[boundary_mask].split(num_chunks.tolist()), batch_first=True, padding_value=0.)
 
             gates = 1. - boundary_probs
-
-            downsampled_tokens = multiply('b n d, b n', downsampled_tokens, boundary_probs)
 
         # for the upsampler
 
