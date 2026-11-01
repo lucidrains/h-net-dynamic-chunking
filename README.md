@@ -88,6 +88,68 @@ ret = net(tokens)
 out, aux_loss = ret.output, ret.loss # (1, 1024, 512), ()
 ```
 
+## Tokenization
+
+```python
+import torch
+from torch import nn
+from h_net_dynamic_chunking import HNet
+
+dim = 512
+
+net = HNet(
+    encoder = nn.Identity(),
+    network = HNet(
+        encoder = nn.Identity(),
+        network = nn.Identity(),
+        decoder = nn.Identity(),
+        dim = dim
+    ),
+    decoder = nn.Identity(),
+    dim = dim
+).eval()
+
+tokens = torch.randn(2, 128, dim)
+lens = torch.tensor([128, 96])
+
+with torch.no_grad():
+    hierarchy = net.tokenize(tokens, lens = lens)
+
+hierarchy.depth                 # 3 levels, fine -> coarse
+hierarchy.finest.embeds         # (2, 128, 512)
+hierarchy.coarsest.embeds       # compressed root
+hierarchy.coarsest.run_lens     # run lengths back to the level below
+
+hierarchy.repeat_interleave()                  # coarsest -> finest
+hierarchy.repeat_interleave(level = 1)         # level 1 -> finest
+hierarchy.repeat_interleave_all()              # every level at base resolution
+hierarchy.to_rle()                             # coarse -> fine (tokens, run_lens)
+```
+
+With vector quantization
+
+```python
+net = HNet(
+    encoder = nn.Identity(),
+    network = HNet(
+        encoder = nn.Identity(),
+        network = nn.Identity(),
+        decoder = nn.Identity(),
+        dim = dim,
+        vq = dict(dim = dim, codebook_size = 2048)
+    ),
+    decoder = nn.Identity(),
+    dim = dim,
+    vq = dict(dim = dim, codebook_size = 2048)
+).eval()
+
+with torch.no_grad():
+    hierarchy = net.tokenize(tokens, lens = lens)
+
+hierarchy.indices                               # tuple of (batch, level length), -1 for padding
+codes = hierarchy.repeat_interleave(use_indices = True)
+```
+
 ## Example
 
 Enwik8 with 2 hierarchies
@@ -125,5 +187,29 @@ $ python train.py
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2511.08544},
+}
+```
+
+```bibtex
+@misc{kim2026hierarchicallatentactionmodel,
+    title   = {Hierarchical Latent Action Model},
+    author  = {Hanjung Kim and Lerrel Pinto and Seon Joo Kim},
+    year    = {2026},
+    eprint  = {2603.05815},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2603.05815},
+}
+```
+
+```bibtex
+@misc{kumbong2026nextconceptmodeling,
+    title   = {Next-Concept Modeling: Fast, Parallel Coarse-to-Fine Text Generation},
+    author  = {Hermann Kumbong and Ishan S. Khare and Iddah Mlauzi and Andrew Woen and Charles Ding and E. Kelly Buchanan and Simran Arora and Azalia Mirhoseini and Christopher Ré},
+    year    = {2026},
+    eprint  = {2610.14162},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CL},
+    url     = {https://arxiv.org/abs/2610.14162},
 }
 ```

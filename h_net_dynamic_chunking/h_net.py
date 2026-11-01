@@ -200,6 +200,21 @@ class HNet(Module):
     def device(self):
         return self.zero.device
 
+    def tokenize(
+        self,
+        tokens,
+        lens = None,
+        vq_mask = None
+    ):
+        """
+        tokenize a sequence into a hierarchy of run-length encoded levels.
+        only the encoder, vq, and dynamic chunker are run.
+        """
+
+        from h_net_dynamic_chunking.hierarchical_tokens import tokenize_hnet
+
+        return tokenize_hnet(self, tokens, lens = lens, vq_mask = vq_mask)
+
     def forward(
         self,
         tokens,
