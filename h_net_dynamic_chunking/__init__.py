@@ -11,3 +11,6 @@ from h_net_dynamic_chunking.hierarchical_tokens import (
 from h_net_dynamic_chunking.multi_head_h_net_dynamic_chunking import MultiHeadDynamicSequenceChunker
 
 from h_net_dynamic_chunking.segmented_attention_pool import SegmentedAttentionPool
+
+from h_net_dynamic_chunking.ratio_loss import chunked_ratio_loss, boundary_entropy_loss
+

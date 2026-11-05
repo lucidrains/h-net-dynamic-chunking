@@ -13,10 +13,11 @@ from einops import repeat, rearrange
 from einops.layers.torch import Rearrange, Reduce
 
 from assoc_scan import AssocScan
-from torch_einops_utils import lens_to_mask, masked_mean
+from torch_einops_utils import lens_to_mask
 
 from x_mlps_pytorch import create_mlp
 
+from h_net_dynamic_chunking.ratio_loss import chunked_ratio_loss, boundary_entropy_loss
 from h_net_dynamic_chunking.segmented_attention_pool import SegmentedAttentionPool
 
 # constants
@@ -75,6 +76,9 @@ class MultiHeadDynamicSequenceChunker(Module):
         boundary_threshold = 0.5,
         target_avg_token_length = 6.,       # N in eq(10)
         ratio_loss_weight = 3e-2,
+        ratio_loss_chunk_size = None,       # if set, ratio loss is computed over windows of this size instead of the whole sequence
+        use_boundary_entropy_loss = False,  # turn on mean-detached within-window binary entropy regularization to sharpen boundary probabilities without affecting average density
+        boundary_entropy_loss_weight = 1e-2,
         handle_residual_proj = False,       # turning this on will automatically handle a projection of the residual and its application in the inverse upsample function
         assoc_scan_use_accelerated = False,
         learning_rate_difference = 0.75,    # in the paper, they report that as one moves up a hierarchy, the learning rate needs to decrease. we'll default to 0.75 for the rough 2.0 -> 1.5 somewhere in the appendix from level 0 -> 1
@@ -143,7 +147,17 @@ class MultiHeadDynamicSequenceChunker(Module):
 
         self.straight_through_frac_vecs = straight_through_frac_vecs
 
+        assert ratio_loss_weight >= 0.
+        assert boundary_entropy_loss_weight >= 0.
+
         self.ratio_loss_weight = ratio_loss_weight
+        self.has_ratio_loss = ratio_loss_weight > 0.
+
+        self.has_boundary_entropy_loss = use_boundary_entropy_loss and boundary_entropy_loss_weight > 0.
+        self.boundary_entropy_loss_weight = boundary_entropy_loss_weight
+
+        assert not exists(ratio_loss_chunk_size) or ratio_loss_chunk_size > 0
+        self.ratio_loss_chunk_size = ratio_loss_chunk_size
 
         # maybe hierarchical loss
 
@@ -395,13 +409,7 @@ class MultiHeadDynamicSequenceChunker(Module):
             # auxiliary ratio loss in section 2.3.2, eq (10)
             # lets follow their notation
 
-            N = self.target_avg_token_length
-
             F = boundary_mask.float()
-
-            mask_for_mean = seq_mask if exists(lens) else None
-
-            G = masked_mean(probs, mask = mask_for_mean, dim = -1)
 
             # allow for a soft F to straight through - https://arxiv.org/abs/2505.22074
 
@@ -409,12 +417,26 @@ class MultiHeadDynamicSequenceChunker(Module):
                 F_soft = (probs - self.boundary_threshold).sigmoid()
                 F = straight_through(F_soft, F)
 
-            F = masked_mean(F, mask = mask_for_mean, dim = -1)
+            if self.has_ratio_loss:
+                aux_loss = chunked_ratio_loss(
+                    probs,
+                    F,
+                    mask = seq_mask if exists(lens) else None,
+                    target_avg_token_length = self.target_avg_token_length,
+                    chunk_size = self.ratio_loss_chunk_size
+                )
 
-            aux_ratio_loss = N / (N - 1) * ((N - 1) * F * G + (1. - F) * (1. - G))
+                weighted_aux_loss = aux_loss * self.ratio_loss_weight
 
-            aux_loss = aux_ratio_loss.mean()
-            weighted_aux_loss = aux_loss * self.ratio_loss_weight
+            if self.has_boundary_entropy_loss:
+                ent_loss = boundary_entropy_loss(
+                    probs,
+                    mask = seq_mask if exists(lens) else None,
+                    target_avg_token_length = self.target_avg_token_length,
+                    chunk_size = self.ratio_loss_chunk_size,
+                    exclude_first = is_first_step
+                )
+                weighted_aux_loss = weighted_aux_loss + ent_loss * self.boundary_entropy_loss_weight
 
         # intermediates
 

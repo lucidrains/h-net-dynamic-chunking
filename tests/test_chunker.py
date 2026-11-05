@@ -765,3 +765,170 @@ def test_nested_multihead_hnet_cache_parity():
 
     sequential_out = torch.cat(sequential_outs, dim = 1)
     assert torch.allclose(parallel_out, sequential_out, atol = 1e-4)
+
+@param('has_lens', (False, True))
+@param('chunk_size', (4, 8, 24))
+def test_chunked_ratio_loss_matches_manual(has_lens, chunk_size):
+    from torch_einops_utils import lens_to_mask
+
+    from h_net_dynamic_chunking.ratio_loss import chunked_ratio_loss
+
+    torch.manual_seed(0)
+
+    batch, seq_len, N = 3, 37, 4.
+    probs = torch.rand(batch, seq_len).requires_grad_()
+    frac_vecs = (probs > 0.5).float()
+
+    lens = torch.tensor([37, 20, 0]) if has_lens else None
+    mask = lens_to_mask(lens, max_len = seq_len) if has_lens else None
+
+    loss = chunked_ratio_loss(probs, frac_vecs, mask = mask, target_avg_token_length = N, chunk_size = chunk_size)
+
+    # manual - mean over windows holding at least one valid token
+
+    manual_losses = []
+
+    for batch_index in range(batch):
+        for start in range(0, seq_len, chunk_size):
+            window = torch.arange(start, min(start + chunk_size, seq_len))
+
+            if has_lens:
+                window = window[mask[batch_index, window]]
+
+            if window.numel() == 0:
+                continue
+
+            F = frac_vecs[batch_index, window].mean()
+            G = probs[batch_index, window].mean()
+
+            manual_losses.append(N / (N - 1) * ((N - 1) * F * G + (1. - F) * (1. - G)))
+
+    assert torch.allclose(loss, torch.stack(manual_losses).mean())
+
+    loss.backward()
+    assert probs.grad is not None and probs.grad.abs().sum() > 0.
+
+@param('has_lens', (False, True))
+def test_chunk_size_beyond_sequence_is_noop(has_lens):
+    from torch_einops_utils import lens_to_mask
+
+    from h_net_dynamic_chunking.ratio_loss import chunked_ratio_loss
+
+    torch.manual_seed(0)
+
+    batch, seq_len, N = 3, 37, 4.
+    probs = torch.rand(batch, seq_len)
+    frac_vecs = (probs > 0.5).float()
+
+    lens = torch.tensor([37, 20, 0]) if has_lens else None
+    mask = lens_to_mask(lens, max_len = seq_len) if has_lens else None
+
+    unbounded = chunked_ratio_loss(probs, frac_vecs, mask = mask, target_avg_token_length = N)
+    single_chunk = chunked_ratio_loss(probs, frac_vecs, mask = mask, target_avg_token_length = N, chunk_size = seq_len + 1)
+
+    assert torch.allclose(unbounded, single_chunk)
+
+@param('heads', (1, 2))
+@param('has_lens', (False, True))
+@param('seq_len', (64, 70))
+def test_ratio_loss_chunk_size(heads, has_lens, seq_len):
+    from torch_einops_utils import lens_to_mask
+
+    from h_net_dynamic_chunking import HNet
+    from h_net_dynamic_chunking.ratio_loss import chunked_ratio_loss
+
+    batch, dim = 2, 32
+    tokens = torch.randn(batch, seq_len, dim).requires_grad_()
+    lens = torch.tensor([seq_len - 13, seq_len]) if has_lens else None
+
+    net = HNet(
+        torch.nn.Identity(),
+        torch.nn.Identity(),
+        torch.nn.Identity(),
+        dim = dim,
+        heads = heads,
+        target_avg_token_length = 4.,
+        ratio_loss_chunk_size = 8
+    )
+
+    out = net(tokens, lens = lens, return_intermediates = True)
+
+    intermediate = out.intermediates
+    mask = lens_to_mask(lens, max_len = seq_len) if has_lens else None
+
+    if has_lens and heads > 1:
+        mask = mask.repeat(heads, 1)
+
+    expected_loss = chunked_ratio_loss(
+        intermediate.probs,
+        intermediate.boundary_mask.float(),
+        mask = mask,
+        target_avg_token_length = 4.,
+        chunk_size = 8
+    )
+
+    assert torch.allclose(out.loss, expected_loss * 3e-2)
+    assert out.loss.numel() == 1 and out.loss.item() > 0.
+
+    out.loss.backward()
+    assert tokens.grad is not None and tokens.grad.abs().sum() > 0.
+
+def test_boundary_entropy_loss_orthogonality():
+    from h_net_dynamic_chunking.ratio_loss import boundary_entropy_loss
+
+    torch.manual_seed(0)
+
+    # Within-chunk MI gradient sums to identically zero over each window (zero gradient on window mean)
+    probs = (0.1 + 0.3 * torch.rand(2, 33)).requires_grad_(True)
+    loss = boundary_entropy_loss(
+        probs,
+        target_avg_token_length = 4.,
+        chunk_size = 8,
+        exclude_first = True
+    )
+    loss.backward()
+    # exclude_first slices probs[:, 1:] into 4 windows of size 8
+    win_grads = probs.grad[:, 1:].reshape(2, 4, 8)
+    assert win_grads.abs().max() > 1e-3
+    assert win_grads.sum(dim = -1).abs().max() < 1e-6
+
+@param('heads', (1, 2))
+@param('has_lens', (False, True))
+def test_hnet_boundary_entropy_loss(heads, has_lens):
+    from h_net_dynamic_chunking import HNet
+
+    batch, seq_len, dim = 2, 48, 32
+    tokens = torch.randn(batch, seq_len, dim).requires_grad_()
+    lens = torch.tensor([35, 48]) if has_lens else None
+
+    net = HNet(
+        torch.nn.Identity(),
+        torch.nn.Identity(),
+        torch.nn.Identity(),
+        dim = dim,
+        heads = heads,
+        target_avg_token_length = 6.,
+        ratio_loss_chunk_size = 12,
+        use_boundary_entropy_loss = True
+    )
+
+    out = net(tokens, lens = lens, return_intermediates = True)
+    assert out.loss.numel() == 1
+    out.loss.backward()
+    assert tokens.grad is not None and tokens.grad.abs().sum() > 0.
+
+    # turning off via boundary_entropy_loss_weight = 0.
+    net_off = HNet(
+        torch.nn.Identity(),
+        torch.nn.Identity(),
+        torch.nn.Identity(),
+        dim = dim,
+        heads = heads,
+        target_avg_token_length = 6.,
+        ratio_loss_chunk_size = 12,
+        use_boundary_entropy_loss = True,
+        boundary_entropy_loss_weight = 0.
+    )
+    assert not net_off.dynamic_sequence_chunker.has_boundary_entropy_loss
+
+
